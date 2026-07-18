@@ -1,0 +1,6 @@
+vizdoom>=1.3.0
+numpy
+pillow
+pywin32
+pywinauto
+pycaw

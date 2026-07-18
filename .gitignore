@@ -1,0 +1,14 @@
+# venv & caches
+.venv/
+__pycache__/
+*.pyc
+
+# per-session / machine-generated
+last_run.log
+_vizdoom.ini
+smoke_frame.png
+cap_before.png
+cap_after.png
+cap_after2.png
+*.lmp
+zdoomstat.txt
