@@ -71,6 +71,7 @@ class ClipboardServer:
 
     def __init__(self):
         self._dib = b""
+        self._render_ts = 0.0
         self._consumed = threading.Event()
         self._consumed.set()  # nothing pending yet
         self._ready = threading.Event()
@@ -128,6 +129,7 @@ class ClipboardServer:
                 _kernel32.GlobalUnlock(hmem)
                 if not _user32.SetClipboardData(fmt, hmem):
                     _kernel32.GlobalFree(hmem)
+        self._render_ts = time.perf_counter()
         self._consumed.set()
 
     # -- game-loop side -----------------------------------------------------
@@ -139,6 +141,14 @@ class ClipboardServer:
         (dropped keystroke); overwriting is then safe by definition.
         """
         self._consumed.wait(wait_prev)
+        # Paint touches the clipboard more than once per paste (format probe,
+        # then the actual insertion); WM_RENDERFORMAT marks only the first
+        # touch. Give the rest a beat before yanking the data away — a
+        # collision here is exactly what pops the "Can't complete operation"
+        # dialog.
+        since_render = time.perf_counter() - self._render_ts
+        if since_render < 0.06:
+            time.sleep(0.06 - since_render)
         deadline = time.perf_counter() + 0.5
         while _user32.GetOpenClipboardWindow() \
                 and time.perf_counter() < deadline:

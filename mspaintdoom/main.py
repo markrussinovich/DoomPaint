@@ -74,6 +74,7 @@ def run() -> int:
     log(f"game wad: {game_wad or 'freedoom'}")
     engine = DoomEngine(wad=args.wad, doom_map=args.map, skill=args.skill,
                         sound=not args.no_sound, game_wad=game_wad)
+    device_changed_at = [0.0]
     if not args.no_sound:
         status = music_mod.audio_output_status()
         if status:
@@ -89,9 +90,11 @@ def run() -> int:
         # All streams should follow a default-device change automatically
         # (music via winmm; effects via the upgraded OpenAL-Soft 1.24, which
         # tracks the default). Note it anyway, with the recovery path.
-        music_mod.watch_default_device(lambda: print(
-            "  (default audio device changed — audio should follow; if "
-            "sound effects vanish, F12 and relaunch run.bat)"))
+        def on_device_change():
+            device_changed_at[0] = time.perf_counter()
+            print("  (default audio device changed — audio should follow; "
+                  "if sound effects vanish, F12 and relaunch run.bat)")
+        music_mod.watch_default_device(on_device_change)
 
     music = MusicPlayer(volume=args.music_volume / 100)
     if not (args.no_sound or args.no_music):
@@ -228,8 +231,9 @@ def run() -> int:
                     peak = sfx_sampler.take()
                     log(f"engine sfx peak this window: {peak:.3f} "
                         f"(fires: {fires_in_window})")
+                    settling = time.perf_counter() - device_changed_at[0] < 15
                     if fires_in_window >= 3 and peak < 0.01 \
-                            and sound_resets < 5:
+                            and not settling and sound_resets < 5:
                         sound_resets += 1
                         log(f"engine silent despite firing — snd_reset "
                             f"#{sound_resets}")

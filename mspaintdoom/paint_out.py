@@ -333,15 +333,17 @@ def start_error_watchdog(hwnd: int) -> None:
             return
         dlg = win.child_window(title_re=".*complete operation.*",
                                control_type="Window")
+        # Hot loop on purpose: a check costs ~20 ms, so at this cadence the
+        # dialog is gone within ~150 ms of appearing — a blink, not a popup.
         while True:
             try:
-                if dlg.exists(timeout=0.05):
+                if dlg.exists(timeout=0.01):
                     dlg.child_window(auto_id="CloseButton",
                                      control_type="Button").invoke()
                     print("  (clipboard-error dialog dismissed)")
             except Exception:
                 pass
-            time.sleep(0.35)
+            time.sleep(0.1)
 
     threading.Thread(target=run, daemon=True,
                      name="mspaintdoom-dlg-watchdog").start()
