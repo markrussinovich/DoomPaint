@@ -215,12 +215,58 @@ class _BrushesCommitter:
             except Exception:
                 self._brushes = None
 
+    def size_canvas(self, width: int, height: int) -> bool:
+        """Make the canvas exactly width x height (the Doom display size).
+
+        Pasting a display-sized frame auto-grows a smaller canvas, and the
+        floating selection then covers exactly the target rect at the origin —
+        so cropping the canvas to that selection also trims the white margins
+        of a larger pre-existing canvas. Best-effort: if it fails, the first
+        game frame still grows the canvas to fit; it just may keep margins.
+        """
+        frame_to_clipboard(Image.new("RGB", (width, height)))
+        try:
+            if not self.paste_uncommitted():
+                return False
+        except PaintNotFocusedError:
+            return False
+        time.sleep(0.2)  # let the floating selection register before cropping
+        if not self._crop_to_selection():
+            return False
+        self._commit()
+        return True
+
+    def _crop_to_selection(self) -> bool:
+        for locator in ({"auto_id": "CropButton", "control_type": "Button"},
+                        {"title": "Crop", "control_type": "Button"}):
+            try:
+                self._win.child_window(**locator).wrapper_object().invoke()
+                return True
+            except Exception:
+                continue
+        # Toolbar hidden? Ctrl+Shift+X crops too, and boot (before the game
+        # loop starts polling) is a safe moment for a synthetic chord.
+        try:
+            sendinput.send_keys(
+                (keys.VK_CONTROL, False), (keys.VK_SHIFT, False),
+                (ord("X"), False), (ord("X"), True),
+                (keys.VK_SHIFT, True), (keys.VK_CONTROL, True))
+        except OSError:
+            return False
+        keys.consume_tap(keys.VK_CONTROL)
+        keys.consume_tap(keys.VK_SHIFT)
+        return True
+
 
 class KeyPaster(_BrushesCommitter):
     """Preferred: paste with Ctrl+V (no menu), commit by switching tools."""
 
-    def paste(self) -> None:
+    def paste_uncommitted(self) -> bool:
         ctrl_v_paste(self._hwnd)
+        return True
+
+    def paste(self) -> None:
+        self.paste_uncommitted()
         self._commit()
 
 
@@ -232,7 +278,7 @@ class MenuPaster(_BrushesCommitter):
         self._edit = self._win.child_window(title="Edit",
                                             control_type="MenuItem")
 
-    def paste(self) -> None:
+    def paste_uncommitted(self) -> bool:
         # Menu automation is racy at game speed; retry, and drop the frame
         # rather than crash if the menu never cooperates this tick.
         for _ in range(3):
@@ -240,14 +286,18 @@ class MenuPaster(_BrushesCommitter):
                 self._edit.expand()
                 self._win.child_window(title="Paste",
                                        control_type="MenuItem").invoke()
-                self._commit()
-                return
+                return True
             except Exception:
                 try:
                     self._edit.collapse()
                 except Exception:
                     pass
                 time.sleep(0.05)
+        return False
+
+    def paste(self) -> None:
+        if self.paste_uncommitted():
+            self._commit()
 
 
 def _window_changed(before: "Image.Image | None",

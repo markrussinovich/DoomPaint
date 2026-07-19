@@ -130,7 +130,7 @@ def run() -> int:
     hwnd = paint_out.launch_paint()
     paint_out.focus_paint(hwnd)
 
-    engine.step([0] * 9, 1)  # warm up one tic
+    frame0 = engine.step([0] * 9, 1)  # warm up one tic
     if paint_out.dismiss_error_dialog(hwnd):
         print("Dismissed a leftover Paint error dialog.")
     paint_out.start_error_watchdog(hwnd)
@@ -143,6 +143,17 @@ def run() -> int:
     else:
         paster = paint_out.MenuPaster(hwnd)
         print("Paste mode: UIA menu fallback (Ctrl+V didn't register here)")
+
+    # Size the canvas to exactly the Doom display, so frames fill it edge to
+    # edge with no leftover white margins.
+    disp_w = frame0.shape[1] * args.scale
+    disp_h = frame0.shape[0] * args.scale
+    if paster.size_canvas(disp_w, disp_h):
+        print(f"Canvas sized to the Doom display ({disp_w}x{disp_h})")
+        log(f"canvas sized to {disp_w}x{disp_h}")
+    else:
+        print("  (couldn't size the canvas — frames will still auto-grow it)")
+        log("canvas sizing failed")
 
     # Capture game keys before Paint sees them: a stray arrow key in Paint
     # dismisses the paste menu / drags the pasted selection and stalls frames.
