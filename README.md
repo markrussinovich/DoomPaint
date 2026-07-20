@@ -10,7 +10,7 @@ the BSD-licensed Freedoom WADs covering the episodes shareware doesn't ship —
 and renders headlessly; every frame is placed on the Windows clipboard and
 pasted into Paint's canvas as a genuine document edit. Which means:
 
-- The spreadsheet-tier framerate (~3–10 fps) is part of the charm.
+- The spreadsheet-tier framerate is part of the charm.
 - **Ctrl+Z rewinds time.** Every frame is an undo step. You died? Un-die.
 - File > Save at any moment produces a legitimate `.png` of your current frame,
   because as far as Paint knows, you painted it.
@@ -48,7 +48,7 @@ window, the default), `--skill 1..5`, `--no-sound` (all audio off),
 (default 40 — the MIDI synth runs much hotter than the engine's effects),
 `--music-wad PATH` (soundtrack from another WAD),
 `--res 320x200|320x240|640x400|640x480` (default `640x400`;
-`320x200` is Doom's native res and pastes ~3× faster, `320x240` is the
+`320x200` is Doom's native res and pastes fastest, `320x240` is the
 aspect-correct 4:3 view — see **How it works**).
 
 **Game data & soundtrack**: `wad\doom1.wad` — the freely-distributable
@@ -127,15 +127,15 @@ echoes registered inputs to the console live.
 
    Paint's per-frame cost is dominated by pixel count, not per-paste overhead,
    so frame **resolution** is the biggest lever on smoothness. The default
-   640×400 tops out around 20 fps here; `--res 320x200` (Doom's authentic
-   native resolution) quarters the pixels and roughly doubles that ceiling, so
-   it runs right up at Doom's 35 Hz tic rate. (Driving 320×200 that fast used
-   to make Paint raise its clipboard-error dialog every ~30–40 s; the OLE
-   in-place clipboard above removes that race entirely, so it's now dialog-free
-   even at full rate.) `320x200` has square pixels, so it looks horizontally
-   stretched; `--res 320x240` is the aspect-correct 4:3 view (how Doom looked on
-   a CRT). Paint's Fit-to-window zoom scales whichever frame back up to the same
-   on-screen size.
+   640×400 is the heaviest; `--res 320x200` (Doom's authentic native
+   resolution) quarters the pixels, so it can run right up to Doom's 35 Hz tic
+   rate. (Driving 320×200 that fast used to make Paint raise its
+   clipboard-error dialog intermittently; the OLE in-place clipboard above
+   removes that race entirely, so it's now dialog-free even at full rate.)
+   `320x200` has square pixels, so it looks horizontally stretched; `--res
+   320x240` is the aspect-correct 4:3 view (how Doom looked on a CRT). Paint's
+   Fit-to-window zoom scales whichever frame back up to the same on-screen
+   size.
 
    **Pacing needs no tuned frame rate.** Two things gate a new frame, and the
    loop simply waits for both: (a) Paint has finished reading the previous

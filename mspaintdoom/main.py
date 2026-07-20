@@ -121,11 +121,14 @@ def run() -> int:
                          "1 or 2 = fixed 1x / 2x")
     ap.add_argument("--res", choices=("320x200", "320x240", "640x400",
                                       "640x480"), default="640x400",
-                    help="engine render resolution (default 640x400). "
-                         "320x200 is Doom's native res and pastes ~2.5x faster "
-                         "(up to the 35 Hz tic rate), but square pixels look "
-                         "stretched; 320x240 is the aspect-correct 4:3 view "
-                         "(~20 fps); 640x* are sharp but slow (~11-13 fps)")
+                    help="engine render resolution (default 640x400). Smaller "
+                         "frames paste into Paint faster (its per-frame cost is "
+                         "pixel-bound): 320x200 is Doom's native res and the "
+                         "fastest, but its square pixels look stretched; "
+                         "320x240 is the aspect-correct 4:3 view; the 640x* "
+                         "sizes are sharpest but slowest. The frame rate is "
+                         "capped at Doom's 35 Hz tic rate and otherwise depends "
+                         "on your machine")
     ap.add_argument("--skill", type=int, default=3, choices=range(1, 6))
     ap.add_argument("--no-sound", action="store_true",
                     help="disable all audio (effects and music)")
