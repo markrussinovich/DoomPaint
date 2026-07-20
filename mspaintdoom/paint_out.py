@@ -29,6 +29,9 @@ from PIL import Image
 from . import capture, clipserve, keys, sendinput
 
 
+_VIEW_SLACK_PX = 24  # extra window slack so the canvas viewport fully fits
+
+
 class PaintNotFocusedError(RuntimeError):
     pass
 
@@ -440,6 +443,73 @@ class _CanvasClickCommitter:
         fit_canvas_zoom(self._hwnd)
         self._fit_after_paste = False
         self._click_point = None
+
+    def set_zoom(self, percent: int) -> bool:
+        """Set Paint's view zoom via the status-bar slider (best-effort).
+
+        Zoom is display-only: pastes stay 1:1 with the canvas, and Paint's
+        integer zoom is nearest-neighbor — so a 640x400 canvas at 200% is
+        pixel-identical to pasting doubled frames at 4x the clipboard cost.
+        """
+        try:
+            slider = self._win.child_window(
+                auto_id="ZoomSliderControl",
+                control_type="Slider").wrapper_object()
+            slider.set_value(percent)
+            return abs(slider.value() - percent) < 1
+        except Exception:
+            return False
+
+    def _viewport(self):
+        """The canvas scroll viewport (wrapper, (l, t, r, b)) or None."""
+        try:
+            sv = self._win.child_window(
+                auto_id="scrollViewer", control_type="Pane").wrapper_object()
+            r = sv.element_info.rectangle
+            return sv, (r.left, r.top, r.right, r.bottom)
+        except Exception:
+            return None
+
+    def fit_window(self, width: int, height: int) -> bool:
+        """Grow the Paint window until the canvas viewport can show a full
+        width x height display, clamped to the monitor work area. Returns
+        True when the whole display is visible.
+        """
+        found = self._viewport()
+        if found is None:
+            return False
+        sv, (vl, vt, vr, vb) = found
+        if vr - vl >= width and vb - vt >= height:
+            return True
+        if not win32gui.IsZoomed(self._hwnd):  # maximized = as big as it gets
+            wl, wt, wr, wb = win32gui.GetWindowRect(self._hwnd)
+            # window chrome around the viewport, plus slack for the scrollbar
+            # strip that disappears once the canvas fits
+            need_w = width + (vl - wl) + (wr - vr) + _VIEW_SLACK_PX
+            need_h = height + (vt - wt) + (wb - vb) + _VIEW_SLACK_PX
+            mon = win32api.MonitorFromWindow(
+                self._hwnd, win32con.MONITOR_DEFAULTTONEAREST)
+            wa_l, wa_t, wa_r, wa_b = win32api.GetMonitorInfo(mon)["Work"]
+            new_w = min(need_w, wa_r - wa_l)
+            new_h = min(need_h, wa_b - wa_t)
+            x = max(wa_l, min(wl, wa_r - new_w))
+            y = max(wa_t, min(wt, wa_b - new_h))
+            win32gui.SetWindowPos(
+                self._hwnd, 0, x, y, new_w, new_h,
+                win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
+            time.sleep(0.2)  # let Paint relayout before re-measuring
+            found = self._viewport()
+            if found is not None:
+                sv, (vl, vt, vr, vb) = found
+        if vr - vl >= width and vb - vt >= height:
+            return True
+        # Screen too small for the whole display: show its top-left corner,
+        # where pastes anchor the frame.
+        try:
+            sv.iface_scroll.SetScrollPercent(0.0, 0.0)
+        except Exception:
+            pass
+        return False
 
     def paste(self) -> None:
         if not self.paste_uncommitted():

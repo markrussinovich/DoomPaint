@@ -41,11 +41,12 @@ alternative for setups (remote desktop, VMs) where Ctrl never arrives at all.
 Input is polled with tap-catching, so a quick fire tap still registers
 despite Paint's low frame rate.
 
-Options: `--map E1M2`, `--wad 2` (Freedoom Phase 2, maps `MAP01`+), `--scale 2`,
-`--skill 1..5`, `--no-sound` (all audio off), `--no-music` (keep sound
-effects, skip the soundtrack), `--music-volume 0..100` (default 40 — the
-MIDI synth runs much hotter than the engine's effects), `--music-wad PATH`
-(soundtrack from another WAD),
+Options: `--map E1M2`, `--wad 2` (Freedoom Phase 2, maps `MAP01`+),
+`--scale 0|1|2` (on-screen zoom via Paint's free view zoom; `0` = autofit the
+window, the default), `--skill 1..5`, `--no-sound` (all audio off),
+`--no-music` (keep sound effects, skip the soundtrack), `--music-volume 0..100`
+(default 40 — the MIDI synth runs much hotter than the engine's effects),
+`--music-wad PATH` (soundtrack from another WAD),
 `--res 320x200|320x240|640x400|640x480` (default `640x400`;
 `320x200` is Doom's native res and pastes ~3× faster, `320x240` is the
 aspect-correct 4:3 view — see **How it works**),

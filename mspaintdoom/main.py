@@ -125,8 +125,12 @@ def run() -> int:
     ap.add_argument("--map", default="E1M1", help="E1M1.. (wad 1), MAP01.. (wad 2)")
     ap.add_argument("--wad", type=int, choices=(1, 2), default=1,
                     help="1=Freedoom Phase 1, 2=Phase 2")
-    ap.add_argument("--scale", type=int, default=1, choices=(1, 2),
-                    help="integer upscale of the 640x400 frame")
+    ap.add_argument("--scale", type=int, default=0, choices=(0, 1, 2),
+                    metavar="N",
+                    help="on-screen upscale, via Paint's free nearest-neighbor "
+                         "view zoom (pixel-doubles only if the zoom slider "
+                         "isn't reachable). 0 = autofit the window (default); "
+                         "1 or 2 = fixed 1x / 2x")
     ap.add_argument("--res", choices=("320x200", "320x240", "640x400",
                                       "640x480"), default="640x400",
                     help="engine render resolution (default 640x400). "
@@ -245,17 +249,20 @@ def run() -> int:
     if paint_out.dismiss_error_dialog(hwnd):
         print("Dismissed a leftover Paint error dialog.")
     paint_out.start_error_watchdog(hwnd)
-    disp_w = frame0.shape[1] * args.scale
-    disp_h = frame0.shape[0] * args.scale
-    canvas_prime = paint_out.prime_canvas(hwnd, disp_w, disp_h)
+
+    # Frames paste at native size; on-screen scaling uses Paint's free,
+    # nearest-neighbor view zoom (a 640x400 canvas at 200% is pixel-identical
+    # to pasting doubled frames, but pastes stay 1x cost). paste_scale only
+    # rises above 1 as a fallback, when the zoom slider can't be driven.
+    paste_scale = 1
+    frame_w, frame_h = frame0.shape[1], frame0.shape[0]
+    canvas_prime = paint_out.prime_canvas(hwnd, frame_w, frame_h)
     if canvas_prime is not None:
         original_zoom, primed_w, primed_h = canvas_prime
         print(f"Canvas primed at {primed_w}x{primed_h} "
-              f"(first paste expands to "
-              f"{disp_w}x{disp_h})")
+              f"(first paste expands to {frame_w}x{frame_h})")
         log(f"canvas primed at {primed_w}x{primed_h} for "
-            f"{disp_w}x{disp_h} frames "
-            f"(original zoom: {original_zoom}%)")
+            f"{frame_w}x{frame_h} frames (original zoom: {original_zoom}%)")
     else:
         original_zoom = None
         print("  (couldn't prime the canvas — frames will still auto-grow it)")
@@ -264,21 +271,42 @@ def run() -> int:
     # Prefer Ctrl+V (opens no menu, never diverts the player's keystrokes); fall
     # back to the Edit>Paste menu only if synthetic keys don't reach this Paint.
     # A subsequent paste commits the previous floating selection automatically.
-    key_paste_works = paint_out.key_paste_lands(hwnd, disp_w, disp_h)
+    key_paste_works = paint_out.key_paste_lands(hwnd, frame_w, frame_h)
     if key_paste_works:
         paster = paint_out.KeyPaster(hwnd)
         print("Paste mode: Ctrl+V (no menus)")
     else:
         paster = paint_out.MenuPaster(hwnd)
         print("Paste mode: UIA menu fallback (Ctrl+V didn't register here)")
-    if original_zoom is not None:
-        if key_paste_works:
-            restored_zoom = paint_out.fit_canvas_zoom(hwnd)
-            if restored_zoom is not None:
-                print(f"Canvas fitted at {restored_zoom}%")
-                log(f"canvas zoom fitted to {restored_zoom}%")
+
+    if args.scale == 0:
+        # Autofit: zoom the native-size canvas to fill the window, snapped to a
+        # crisp integer pixel ratio.
+        if original_zoom is not None:
+            if key_paste_works:
+                zoom = paint_out.fit_canvas_zoom(hwnd)
+                if zoom is not None:
+                    print(f"Autofit: canvas zoomed to {zoom}%")
+                    log(f"autofit zoom {zoom}%")
+            else:
+                paster.fit_zoom_after_next_paste()
+    else:
+        # Explicit scale via Paint's view zoom (free); pixel-double as fallback.
+        if paster.set_zoom(args.scale * 100):
+            print(f"Scaling via Paint's {args.scale * 100}% view zoom "
+                  "(frames paste at 1x — full framerate)")
+            log(f"view zoom {args.scale * 100}%; pasting 1x frames")
         else:
-            paster.fit_zoom_after_next_paste()
+            paste_scale = args.scale
+            print("  (zoom control not found — pasting pixel-doubled frames)")
+            log("zoom unavailable; pixel-doubling frames")
+        disp_w, disp_h = frame_w * args.scale, frame_h * args.scale
+        if paster.fit_window(disp_w, disp_h):
+            log(f"window fits the {disp_w}x{disp_h} display")
+        else:
+            print(f"  (screen too small to show the whole {disp_w}x{disp_h} "
+                  "display — showing its top-left)")
+            log("window could not fit the display")
 
     # Capture game keys before Paint sees them: a stray arrow key in Paint
     # dismisses the paste menu / drags the pasted selection and stalls frames.
@@ -305,7 +333,7 @@ def run() -> int:
     paste_misses = 0
     renderer = None
     if args.render_mode != "eager":
-        renderer = OnDemandRenderer(engine, args.scale, args.render_mode,
+        renderer = OnDemandRenderer(engine, paste_scale, args.render_mode,
                                     MAX_TICS_PER_FRAME)
         print(f"Render mode: {args.render_mode} (frame produced on Paint's "
               f"clipboard read)")
@@ -367,7 +395,7 @@ def run() -> int:
                 continue  # engine produced nothing new (paused/stalled)
             try:
                 previous_consumed = paint_out.push_frame(
-                    hwnd, frame, paster, scale=args.scale,
+                    hwnd, frame, paster, scale=paste_scale,
                     render_fn=(renderer.render_fn if renderer else None))
             except paint_out.PaintNotFocusedError:
                 continue  # user tabbed away mid-frame; loop back to pause
