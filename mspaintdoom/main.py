@@ -226,7 +226,10 @@ def run() -> int:
     print("Finding MS Paint...")
     print("Paste pacing: engine-tic paced (scales to your hardware)")
     hwnd = paint_out.launch_paint()
-    paint_out.focus_paint(hwnd)
+    if not paint_out.focus_paint(hwnd):
+        print("  (couldn't bring Paint to the foreground — if it's open behind "
+              "another window, click it so keystrokes and pastes land)")
+        log("could not focus Paint at startup")
 
     frame0 = engine.step([0] * 9, 1)  # warm up one tic
     if paint_out.dismiss_error_dialog(hwnd):

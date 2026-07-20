@@ -89,28 +89,47 @@ def launch_paint(timeout: float = 20.0) -> int:
     raise RuntimeError("Paint window did not appear")
 
 
-def focus_paint(hwnd: int) -> None:
+def focus_paint(hwnd: int, timeout: float = 5.0) -> bool:
+    """Bring Paint to the foreground and confirm it, returning success.
+
+    Retries until Paint is actually foreground or `timeout` elapses. A freshly
+    launched window usually activates on the first try, but one we're *attaching*
+    to (Paint was already open behind another window) often does not, and
+    Windows' foreground lock rejects SetForegroundWindow from a background
+    process until a synthetic Alt tap grants permission. Callers that then drive
+    Paint (canvas priming, the Ctrl+V self-test) depend on this actually landing;
+    a single best-effort attempt was what let the self-test flake to the slow
+    menu paster when Paint started unfocused.
+    """
     if win32gui.IsIconic(hwnd):
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-    try:
-        win32gui.SetForegroundWindow(hwnd)
-    except win32gui.error:
-        pass  # foreground lock — fall through to stronger measures
-    time.sleep(0.1)
-    if paint_is_foreground(hwnd):
-        return
-    # Foreground lock workaround #1: SwitchToThisWindow (alt-tab semantics).
-    ctypes.windll.user32.SwitchToThisWindow(hwnd, True)
-    time.sleep(0.2)
-    if paint_is_foreground(hwnd):
-        return
-    # Workaround #2: a synthetic Alt tap grants SetForegroundWindow permission.
-    sendinput.send_keys((win32con.VK_MENU, False), (win32con.VK_MENU, True))
-    try:
-        win32gui.SetForegroundWindow(hwnd)
-    except win32gui.error:
-        pass
-    time.sleep(0.2)
+    deadline = time.perf_counter() + timeout
+    while True:
+        if paint_is_foreground(hwnd):
+            return True
+        try:
+            win32gui.SetForegroundWindow(hwnd)
+        except win32gui.error:
+            pass  # foreground lock — fall through to stronger measures
+        if paint_is_foreground(hwnd):
+            return True
+        # Workaround #1: SwitchToThisWindow (alt-tab semantics).
+        ctypes.windll.user32.SwitchToThisWindow(hwnd, True)
+        time.sleep(0.1)
+        if paint_is_foreground(hwnd):
+            return True
+        # Workaround #2: a synthetic Alt tap grants SetForegroundWindow
+        # permission past the foreground lock.
+        sendinput.send_keys((win32con.VK_MENU, False), (win32con.VK_MENU, True))
+        try:
+            win32gui.SetForegroundWindow(hwnd)
+        except win32gui.error:
+            pass
+        if paint_is_foreground(hwnd):
+            return True
+        if time.perf_counter() >= deadline:
+            return False
+        time.sleep(0.2)
 
 
 def paint_is_foreground(hwnd: int) -> bool:
@@ -566,16 +585,58 @@ def _window_changed(before: "Image.Image | None",
 
 def key_paste_lands(hwnd: int, width: int = 640, height: int = 400,
                     attempts: int = 4) -> bool:
-    """Self-test: does a synthetic Ctrl+V actually paint the canvas here?
+    """Self-test: does a synthetic Ctrl+V actually reach this Paint?
 
-    Pastes alternating solid colours and checks the window changed. Runs a few
-    times because the first paste after launch is often a warm-up no-op.
+    A landed paste becomes a floating selection, which enables Paint's Crop
+    button — a UI Automation signal that's robust to the window compositing and
+    PrintWindow capture quirks a screenshot diff isn't. Retries a few times
+    because the first paste after launch is often a warm-up no-op. Falls back to
+    a pixel-diff check if the selection state can't be queried.
     """
-    if not paint_is_foreground(hwnd):
+    if not focus_paint(hwnd):
         return False
+    try:
+        from pywinauto import Application
+        from pywinauto.timings import Timings
+        Timings.window_find_timeout = 1.0
+        win = Application(backend="uia").connect(handle=hwnd) \
+            .window(handle=hwnd)
+        crop = win.child_window(auto_id="CropButton",
+                                control_type="Button").wrapper_object()
+        if crop.is_enabled():
+            # A selection is already active, so "selection appeared" can't tell
+            # us anything; use the pixel-diff self-test instead.
+            return _pixel_paste_lands(hwnd, width, height, attempts)
+    except Exception:
+        return _pixel_paste_lands(hwnd, width, height, attempts)
+    swatch = Image.new("RGB", (width, height), (10, 220, 80))
+    for _ in range(attempts):
+        if not focus_paint(hwnd):
+            return False
+        frame_to_clipboard(swatch)
+        try:
+            ctrl_v_paste(hwnd)
+        except PaintNotFocusedError:
+            return False
+        deadline = time.perf_counter() + 0.6
+        while time.perf_counter() < deadline:
+            try:
+                if crop.is_enabled():  # a floating selection => paste landed
+                    return True
+            except Exception:
+                break
+            time.sleep(0.02)
+    return False
+
+
+def _pixel_paste_lands(hwnd: int, width: int, height: int,
+                       attempts: int) -> bool:
+    """Fallback self-test: diff the window pixels around a paste."""
     swatches = [Image.new("RGB", (width, height), c)
                 for c in ((10, 220, 80), (220, 40, 140))]
     for i in range(attempts):
+        if not focus_paint(hwnd):
+            return False
         before = capture.grab_window(hwnd)
         frame_to_clipboard(swatches[i % 2])
         try:
