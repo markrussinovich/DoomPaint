@@ -8,8 +8,8 @@ Two paste paths, chosen at startup by a self-test:
 * MenuPaster — Paint's Edit>Paste via UI Automation. Rock-solid, but briefly
   opens the Edit menu each frame, which can swallow keystrokes. Fallback only.
 
-Each new paste implicitly commits the previous floating selection. The final
-selection is committed with one outside-canvas click when the game exits.
+Each new paste implicitly commits the previous floating selection, so no
+explicit per-frame commit is needed; the final frame is left floating on exit.
 """
 import ctypes
 import io
@@ -29,11 +29,13 @@ from PIL import Image
 from . import capture, clipserve, keys, sendinput
 
 
-_VIEW_SLACK_PX = 24  # extra window slack so the canvas viewport fully fits
-
-
 class PaintNotFocusedError(RuntimeError):
     pass
+
+
+# Extra room asked of fit_window beyond the display itself: covers the
+# scrollbar strip (which vanishes once the canvas fits) plus a little margin.
+_VIEW_SLACK_PX = 24
 
 
 def _window_exe(hwnd: int) -> str:
