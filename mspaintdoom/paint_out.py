@@ -703,18 +703,10 @@ def arm_error_watchdog() -> None:
     _error_watchdog_wake.set()
 
 
-def push_frame(hwnd: int, frame, paster, scale: int = 1, render_fn=None) -> bool:
-    if render_fn is not None:
-        # Render-on-demand: hand the clipboard a thunk instead of bytes; the
-        # frame is produced only when Paint actually reads it (freshest frame).
-        paster.wait_ready()
-        previous_consumed = _clipboard().publish(render_fn=render_fn)
-        paster.paste()
-        return previous_consumed
-    dib = encode_frame(frame, scale)
-    # Encoding happens before any pending one-time startup/final commit wait,
-    # so the next image is ready at the clipboard swap boundary.
+def push_frame(paster, render_fn) -> bool:
+    """Advertise the freshest frame — produced only when Paint reads the
+    clipboard (render_fn is a zero-arg thunk) — and paste it."""
     paster.wait_ready()
-    previous_consumed = _clipboard().publish(dib=dib)
+    previous_consumed = _clipboard().publish(render_fn=render_fn)
     paster.paste()
     return previous_consumed

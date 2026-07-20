@@ -49,8 +49,7 @@ window, the default), `--skill 1..5`, `--no-sound` (all audio off),
 `--music-wad PATH` (soundtrack from another WAD),
 `--res 320x200|320x240|640x400|640x480` (default `640x400`;
 `320x200` is Doom's native res and pastes ~3× faster, `320x240` is the
-aspect-correct 4:3 view — see **How it works**),
-`--render-mode push|pull|eager` (default `push`; see **How it works**).
+aspect-correct 4:3 view — see **How it works**).
 
 **Game data & soundtrack**: `wad\doom1.wad` — the freely-distributable
 shareware episode — is both the game data and the source of the real Bobby
@@ -148,14 +147,11 @@ echoes registered inputs to the console live.
    to tune, so it scales to the hardware automatically (faster PC → faster, up
    to 35; slower PC → slower).
 
-   By default (`--render-mode push`) the engine runs on its own thread at
-   Doom's native 35 Hz, and Paint's clipboard read (its `GetData` call) is
-   answered with the *freshest* finished frame the instant it reads — so what
-   appears reflects the current game state rather than the one queued when the
-   Ctrl+V was sent, measurably lowering on-screen latency. `--render-mode pull`
-   goes further, stepping the engine *inside* the read for the lowest latency,
-   at the cost of tying the simulation cadence to Paint's jittery reads; `eager`
-   is the legacy path that binds and encodes each frame at submit time.
+   The engine runs on its own thread at Doom's native 35 Hz, and Paint's
+   clipboard read (its `GetData` call) is answered with the *freshest* finished
+   frame the instant it reads — so what appears reflects the current game state
+   rather than the one queued when the Ctrl+V was sent, measurably lowering
+   on-screen latency.
 3. **Sound** — effects come from the engine itself (ViZDoom plays them through
    OpenAL on the default device; the sfx volume is pinned at launch because
    ZDoom persists cvars to `_vizdoom.ini`, and a stale zero would mute every

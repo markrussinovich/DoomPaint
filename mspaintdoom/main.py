@@ -24,22 +24,17 @@ PASTE_MISSES_BEFORE_FALLBACK = 8
 
 
 class OnDemandRenderer:
-    """Produce the frame at the moment Paint reads the clipboard.
+    """Free-run the engine on a dedicated thread at the tic rate; the clipboard
+    read returns the most recent pre-encoded frame.
 
-    The engine is only ever touched from ONE thread (ViZDoom is not
-    thread-safe):
-      * pull  -> engine.step runs inside the clipboard render callback, so the
-                 displayed frame is generated the instant Paint reads it
-                 (lowest latency, but the simulation only advances on reads).
-      * push  -> a dedicated engine thread free-runs at the tic rate; the read
-                 callback just returns the most recent pre-encoded frame
-                 (smooth simulation, latency ~= one tic).
+    ViZDoom is not thread-safe, so the engine is only ever touched from this one
+    thread. Paint's read gets the freshest finished frame (latency ~= one tic)
+    without stepping the simulation inside the read.
     """
 
-    def __init__(self, engine, scale, mode, max_tics):
+    def __init__(self, engine, scale, max_tics):
         self._engine = engine
         self._scale = scale
-        self._mode = mode
         self._max_tics = max_tics
         self._action = [0] * 9
         self._last = time.perf_counter()
@@ -49,14 +44,13 @@ class OnDemandRenderer:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._new_frame = threading.Event()  # set when a fresh tic frame exists
-        if mode == "push":
-            try:
-                self._latest_dib = self._step_encode()  # seed so the very
-                self._new_frame.set()                    # first read is never
-            except Exception:                            # empty (cold-start)
-                pass
-            threading.Thread(target=self._push_loop, daemon=True,
-                             name="mspaintdoom-engine").start()
+        try:
+            self._latest_dib = self._step_encode()  # seed so the very first
+            self._new_frame.set()                    # read is never empty
+        except Exception:                            # (cold-start)
+            pass
+        threading.Thread(target=self._push_loop, daemon=True,
+                         name="mspaintdoom-engine").start()
 
     def set_action(self, action) -> None:
         self._action = action
@@ -83,19 +77,13 @@ class OnDemandRenderer:
         return paint_out.encode_frame(frame, self._scale)  # immutable bytes
 
     def render_fn(self) -> bytes:
-        if self._mode == "pull":
-            return self._step_encode()
         with self._lock:
             return self._latest_dib
 
     def wait_new_frame(self, timeout: float) -> bool:
-        """Block until the engine has produced a new frame (i.e. a tic
-        advanced), so the paste loop never submits faster than the simulation
-        actually moves — the tic rate is the cap, with no separate constant to
-        keep in sync. In pull mode the frame is rendered inside Paint's read, so
-        every read is inherently fresh and this returns at once."""
-        if self._mode != "push":
-            return True
+        """Block until the engine has produced a new frame (a tic advanced), so
+        the paste loop never submits faster than the simulation moves — the tic
+        rate is the cap, with no separate constant to keep in sync."""
         got = self._new_frame.wait(timeout)
         self._new_frame.clear()
         return got
@@ -151,14 +139,6 @@ def run() -> int:
                          "commercial doom.wad you own for the original "
                          "tracks (wad\\doom.wad / wad\\doom2.wad are "
                          "auto-detected). Game data stays Freedoom.")
-    ap.add_argument("--render-mode", choices=("eager", "pull", "push"),
-                    default="push",
-                    help="when to produce each frame: 'push' (default) "
-                         "free-runs the engine on its own thread and serves "
-                         "the freshest frame on Paint's clipboard read; 'pull' "
-                         "runs the engine inside the read (lowest latency, but "
-                         "the simulation only advances on reads); 'eager' "
-                         "encodes at submit time (legacy behaviour)")
     args = ap.parse_args()
 
     # Session log: what the game actually saw, for post-mortem diagnosis.
@@ -331,16 +311,10 @@ def run() -> int:
     sound_resets = 0
     sfx_sampler = None if args.no_sound else music_mod.SessionPeakSampler()
     paste_misses = 0
-    renderer = None
-    if args.render_mode != "eager":
-        renderer = OnDemandRenderer(engine, paste_scale, args.render_mode,
-                                    MAX_TICS_PER_FRAME)
-        print(f"Render mode: {args.render_mode} (frame produced on Paint's "
-              f"clipboard read)")
+    renderer = OnDemandRenderer(engine, paste_scale, MAX_TICS_PER_FRAME)
     # No frame timer: the loop is gated purely by engine tics + Paint readiness
     # (see the loop body), so it self-scales to the hardware.
     stat_t0 = time.perf_counter()
-    last = time.perf_counter()
     try:
         while True:
             if keys.quit_requested():
@@ -352,21 +326,17 @@ def run() -> int:
                     log("paused (Paint lost focus)")
                     was_paused = True
                 music.pause()
-                if renderer:
-                    renderer.set_paused(True)
-                last = time.perf_counter()  # don't bank time while paused
+                renderer.set_paused(True)
                 time.sleep(0.10)
                 continue
             if was_paused:
                 log("resumed (Paint focused)")
                 was_paused = False
             music.resume()
-            if renderer:
-                renderer.set_paused(False)
+            renderer.set_paused(False)
 
             action = keys.poll_action()
-            if renderer:
-                renderer.set_action(action)
+            renderer.set_action(action)
             if action[4] and not (last_action and last_action[4]):
                 fires_in_window += 1
             if action != last_action:
@@ -377,26 +347,17 @@ def run() -> int:
                 if os.environ.get("MSPAINTDOOM_DEBUG"):
                     print(f"  input: {'+'.join(pressed) or '(none)'}")
                 last_action = action
-            now = time.perf_counter()
-            if renderer is None:
-                tics = min(MAX_TICS_PER_FRAME,
-                           max(1, round((now - last) * TICRATE)))
-                last = now
-                frame = engine.step(action, tics)
-            else:
-                frame = None  # produced on demand when Paint reads
             # Pace on the two things that actually gate a new frame — no timer:
             #   (b) the engine advanced a tic (a fresh frame exists), and
             #   (a) Paint finished reading the previous frame (publish() waits
             #       on its GetData below).
             # Their combination self-scales to the hardware: min(tic rate,
             # Paint's composite rate), with no rate constant to keep in sync.
-            if renderer is not None and not renderer.wait_new_frame(0.25):
+            if not renderer.wait_new_frame(0.25):
                 continue  # engine produced nothing new (paused/stalled)
             try:
                 previous_consumed = paint_out.push_frame(
-                    hwnd, frame, paster, scale=paste_scale,
-                    render_fn=(renderer.render_fn if renderer else None))
+                    paster, renderer.render_fn)
             except paint_out.PaintNotFocusedError:
                 continue  # user tabbed away mid-frame; loop back to pause
             except Exception as e:
@@ -425,10 +386,7 @@ def run() -> int:
                             f"#{sound_resets}")
                         print("  (engine audio is silent — resetting the "
                               "engine sound system)")
-                        if renderer:
-                            renderer.request_reset_sound()
-                        else:
-                            engine.reset_sound()
+                        renderer.request_reset_sound()
                     fires_in_window = 0
             if isinstance(paster, paint_out.KeyPaster):
                 if previous_consumed:
@@ -462,11 +420,9 @@ def run() -> int:
             paster.wait_ready()
         except Exception as e:
             print(f"  (couldn't commit final frame: {e})")
-        if renderer:
-            renderer.stop()
+        renderer.stop()
         music.stop()
-        # Finalize while the engine is still alive: in pull mode this renders
-        # one last real frame on demand instead of leaving a dead promise.
+        # Finalize while the engine is still alive so the last frame persists.
         paint_out.release_clipboard()
         engine.close()
         print("Doom has left the canvas.")
