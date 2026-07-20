@@ -22,7 +22,6 @@ cross-process GetData calls are serviced promptly.
 """
 import atexit
 import threading
-import time
 
 import pythoncom
 import win32api
@@ -132,7 +131,6 @@ class ClipboardServer:
         self._dib = b""
         self._last_good = b""  # last non-empty frame actually served
         self._render_fn = None  # if set, called on demand to produce the DIB
-        self._render_finished_at = 0.0
         self._consumed = threading.Event()
         self._consumed.set()  # nothing pending yet
         self._lock = threading.Lock()
@@ -163,7 +161,6 @@ class ClipboardServer:
                 self._last_good = data
             else:
                 data = self._last_good
-        self._render_finished_at = time.perf_counter()
         if data:
             self._consumed.set()
         return data
