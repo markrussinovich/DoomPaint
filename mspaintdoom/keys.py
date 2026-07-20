@@ -126,6 +126,7 @@ _down: set[int] = set()      # swallowed keys currently held
 _tapped: set[int] = set()    # swallowed since last poll (tap latch)
 _quit_tapped = False
 _grab_when = None            # callable() -> bool: swallow game keys now?
+_hook_installed = False      # True once the LL hook is active (else async-only)
 
 
 def _hook_cb(ncode, wparam, lparam):
@@ -197,7 +198,9 @@ def install_hook(grab_when) -> bool:
 
     threading.Thread(target=pump, daemon=True, name="mspaintdoom-kbd").start()
     installed.wait(3.0)
-    return bool(result and result[0])
+    global _hook_installed
+    _hook_installed = bool(result and result[0])
+    return _hook_installed
 
 
 # ---------------------------------------------------------------------------
@@ -205,12 +208,24 @@ def install_hook(grab_when) -> bool:
 
 
 def poll_action() -> list[int]:
-    """Current action vector in engine button order (down OR tapped)."""
+    """Current action vector in engine button order (down OR tapped).
+
+    Input is sampled on the render thread every tic, concurrently with the
+    Ctrl+V paste the game loop injects. The hook's swallow table is authoritative
+    for the keys it captures and — unlike global GetAsyncKeyState — excludes our
+    own injected keystrokes, so a paste's Ctrl isn't misread as the player
+    firing. Async key state is consulted only for keys the hook doesn't swallow
+    (Shift), or when the hook isn't installed (degraded fallback).
+    """
     taps = set(_tapped)
     _tapped.difference_update(taps)
 
     def active(vk: int) -> bool:
-        return vk in _down or vk in taps or _async_active(vk)
+        if vk in _down or vk in taps:
+            return True
+        if _hook_installed and vk in _SWALLOW_VKS:
+            return False
+        return _async_active(vk)
 
     return [1 if any(active(vk) for vk in binding) else 0
             for binding in _ACTION_BINDINGS]
