@@ -33,7 +33,8 @@ def run() -> int:
     ap.add_argument("--wad", type=int, choices=(1, 2), default=1,
                     help="1=Freedoom Phase 1, 2=Phase 2")
     ap.add_argument("--scale", type=int, default=1, choices=(1, 2),
-                    help="integer upscale of the 640x400 frame")
+                    help="on-screen upscale of the 640x400 frame (done via "
+                         "Paint's view zoom when available, so it's free)")
     ap.add_argument("--skill", type=int, default=3, choices=range(1, 6))
     ap.add_argument("--no-sound", action="store_true",
                     help="disable all audio (effects and music)")
@@ -144,16 +145,41 @@ def run() -> int:
         paster = paint_out.MenuPaster(hwnd)
         print("Paste mode: UIA menu fallback (Ctrl+V didn't register here)")
 
-    # Size the canvas to exactly the Doom display, so frames fill it edge to
+    # Scale via Paint's own view zoom when we can: zoom is display-only and
+    # nearest-neighbor, so a 640x400 canvas at 200% looks pixel-identical to
+    # pasting doubled frames — but each paste moves 4x less data, so scale 2
+    # runs at scale 1 framerate.
+    paste_scale = args.scale
+    if args.scale > 1:
+        if paster.set_zoom(args.scale * 100):
+            paste_scale = 1
+            print(f"Scaling via Paint's {args.scale * 100}% view zoom "
+                  "(frames paste at 1x — full framerate)")
+            log(f"view zoom {args.scale * 100}%; pasting 1x frames")
+        else:
+            print("  (zoom control not found — pasting scaled frames)")
+            log("zoom unavailable; pasting scaled frames")
+
+    # Size the canvas to exactly the pasted frame, so frames fill it edge to
     # edge with no leftover white margins.
-    disp_w = frame0.shape[1] * args.scale
-    disp_h = frame0.shape[0] * args.scale
-    if paster.size_canvas(disp_w, disp_h):
-        print(f"Canvas sized to the Doom display ({disp_w}x{disp_h})")
-        log(f"canvas sized to {disp_w}x{disp_h}")
+    canvas_w = frame0.shape[1] * paste_scale
+    canvas_h = frame0.shape[0] * paste_scale
+    if paster.size_canvas(canvas_w, canvas_h):
+        print(f"Canvas sized to the Doom display ({canvas_w}x{canvas_h})")
+        log(f"canvas sized to {canvas_w}x{canvas_h}")
     else:
         print("  (couldn't size the canvas — frames will still auto-grow it)")
         log("canvas sizing failed")
+
+    # Make sure the whole display (canvas x zoom) is visible in the window.
+    disp_w = frame0.shape[1] * args.scale
+    disp_h = frame0.shape[0] * args.scale
+    if paster.fit_window(disp_w, disp_h):
+        log(f"window fits the {disp_w}x{disp_h} display")
+    else:
+        print(f"  (screen too small to show the whole {disp_w}x{disp_h} "
+              "display — showing its top-left)")
+        log("window could not fit the display")
 
     # Capture game keys before Paint sees them: a stray arrow key in Paint
     # dismisses the paste menu / drags the pasted selection and stalls frames.
@@ -221,7 +247,7 @@ def run() -> int:
                 engine_moved = True
             prev_frame = frame
             try:
-                paint_out.push_frame(hwnd, frame, paster, scale=args.scale)
+                paint_out.push_frame(hwnd, frame, paster, scale=paste_scale)
             except paint_out.PaintNotFocusedError:
                 continue  # user tabbed away mid-frame; loop back to pause
             except Exception as e:
