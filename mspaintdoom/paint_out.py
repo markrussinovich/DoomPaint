@@ -104,6 +104,7 @@ def focus_paint(hwnd: int, timeout: float = 5.0) -> bool:
     if win32gui.IsIconic(hwnd):
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
     deadline = time.perf_counter() + timeout
+    alt_tapped = False
     while True:
         if paint_is_foreground(hwnd):
             return True
@@ -113,20 +114,26 @@ def focus_paint(hwnd: int, timeout: float = 5.0) -> bool:
             pass  # foreground lock — fall through to stronger measures
         if paint_is_foreground(hwnd):
             return True
-        # Workaround #1: SwitchToThisWindow (alt-tab semantics).
+        # Workaround #1: SwitchToThisWindow (alt-tab semantics). Targets our
+        # window only, so it's safe to retry each iteration.
         ctypes.windll.user32.SwitchToThisWindow(hwnd, True)
         time.sleep(0.1)
         if paint_is_foreground(hwnd):
             return True
         # Workaround #2: a synthetic Alt tap grants SetForegroundWindow
-        # permission past the foreground lock.
-        sendinput.send_keys((win32con.VK_MENU, False), (win32con.VK_MENU, True))
-        try:
-            win32gui.SetForegroundWindow(hwnd)
-        except win32gui.error:
-            pass
-        if paint_is_foreground(hwnd):
-            return True
+        # permission past the foreground lock — but do it ONCE only. It's a
+        # global keystroke, so repeating it every iteration would spam the menu
+        # bar of whatever window actually has focus if Paint won't come forward.
+        if not alt_tapped:
+            alt_tapped = True
+            sendinput.send_keys(
+                (win32con.VK_MENU, False), (win32con.VK_MENU, True))
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+            except win32gui.error:
+                pass
+            if paint_is_foreground(hwnd):
+                return True
         if time.perf_counter() >= deadline:
             return False
         time.sleep(0.2)
