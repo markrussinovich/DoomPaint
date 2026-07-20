@@ -407,10 +407,9 @@ def prime_canvas(hwnd: int, target_width: int,
     return None
 
 
-class _CanvasClickCommitter:
-    """Commit each floating paste by clicking outside the canvas."""
-
-    _REPROBE_EVERY = 100
+class _Paster:
+    """Paste frames into Paint. Each new paste implicitly commits the previous
+    floating selection, so no explicit per-frame commit is needed."""
 
     def __init__(self, hwnd: int):
         from pywinauto import Application
@@ -419,20 +418,9 @@ class _CanvasClickCommitter:
         self._hwnd = hwnd
         self._win = Application(backend="uia").connect(handle=hwnd) \
             .window(handle=hwnd)
-        self._view_hwnd = win32gui.FindWindowEx(
-            hwnd, 0, "MSPaintView", None)
         self._crop = self._win.child_window(
             auto_id="CropButton", control_type="Button").wrapper_object()
-        self._click_point = None
-        self._commits = 0
-        self._commit_pending = False
         self._fit_after_paste = False
-
-    def _find_click_point(self):
-        try:
-            return _margin_click_point(self._win, self._view_hwnd)
-        except Exception:
-            return None
 
     def fit_zoom_after_next_paste(self) -> None:
         self._fit_after_paste = True
@@ -442,7 +430,6 @@ class _CanvasClickCommitter:
             return
         fit_canvas_zoom(self._hwnd)
         self._fit_after_paste = False
-        self._click_point = None
 
     def set_zoom(self, percent: int) -> bool:
         """Set Paint's view zoom via the status-bar slider (best-effort).
@@ -531,46 +518,16 @@ class _CanvasClickCommitter:
             time.sleep(0.002)
         return False
 
-    def wait_ready(self) -> None:
-        if not self._commit_pending:
-            return
-        if not self._wait_for_selection(False):
-            raise RuntimeError("Paint did not finish committing the selection")
-        self._commit_pending = False
 
-    def commit_existing_selection(self) -> None:
-        if not self._selection_is_active():
-            return
-        if not self._commit():
-            raise RuntimeError("could not commit Paint's existing selection")
-        self._commit_pending = True
-
-    def _commit(self) -> bool:
-        if not paint_is_foreground(self._hwnd):
-            return False
-        if win32api.GetAsyncKeyState(win32con.VK_LBUTTON) & 0x8000:
-            return False
-
-        self._commits += 1
-        if self._click_point is None \
-                or self._commits % self._REPROBE_EVERY == 0:
-            self._click_point = self._find_click_point()
-        if self._click_point is None:
-            return False
-
-        _click_screen_point(self._click_point)
-        return True
-
-
-class KeyPaster(_CanvasClickCommitter):
-    """Preferred: paste with Ctrl+V, commit with an outside-canvas click."""
+class KeyPaster(_Paster):
+    """Preferred: paste with Ctrl+V (no menu); the next paste commits it."""
 
     def paste_uncommitted(self) -> bool:
         ctrl_v_paste(self._hwnd)
         return True
 
 
-class MenuPaster(_CanvasClickCommitter):
+class MenuPaster(_Paster):
     """Fallback: paste via the Edit>Paste menu item (briefly opens the menu)."""
 
     def __init__(self, hwnd: int):
@@ -706,7 +663,6 @@ def arm_error_watchdog() -> None:
 def push_frame(paster, render_fn) -> bool:
     """Advertise the freshest frame — produced only when Paint reads the
     clipboard (render_fn is a zero-arg thunk) — and paste it."""
-    paster.wait_ready()
     previous_consumed = _clipboard().publish(render_fn=render_fn)
     paster.paste()
     return previous_consumed

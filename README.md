@@ -88,8 +88,8 @@ echoes registered inputs to the console live.
    A pasted image lands as a *floating selection*. The next paste implicitly
    commits it, preserving one Undo step per frame without a separate flattening
    action. The low-level input hook prevents gameplay keys from moving the
-   selection; the last frame is committed with one outside-canvas click when
-   the game exits.
+   selection. The final frame is left as an uncommitted floating selection when
+   the game exits — there is no explicit per-frame commit step.
 
    Before the first paste, the canvas's bottom-right resize handle is
    synthetically dragged to make it 1×1 pixel. If the handle is offscreen above
@@ -192,11 +192,13 @@ echoes registered inputs to the console live.
    leak into Paint). A tap latch catches keys pressed and released between
    the ~200 ms input samples.
 
-**The commit never uses a synthetic Esc.** An earlier version committed with
-Esc — but while you hold Ctrl to fire, that Esc becomes **Ctrl+Esc**, which
-opens the Windows Start menu, steals focus, and freezes the game. The
-outside-canvas click avoids keyboard chords entirely, and the Ctrl+V path
-avoids opening any menu that could eat gameplay keys.
+**Frames commit implicitly — no synthetic Esc, no click.** An earlier version
+committed each floating selection explicitly (first with Esc, later with an
+outside-canvas click). Esc was actively dangerous: while you hold Ctrl to fire,
+that Esc becomes **Ctrl+Esc**, which opens the Windows Start menu, steals focus,
+and freezes the game. Letting the *next* paste commit the previous frame avoids
+per-frame keyboard chords and clicks entirely, and the Ctrl+V paste path avoids
+opening any menu that could eat gameplay keys.
 
 ## Files
 

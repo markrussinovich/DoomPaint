@@ -418,11 +418,6 @@ def run() -> int:
     except KeyboardInterrupt:
         return 0
     finally:
-        try:
-            paster.commit_existing_selection()
-            paster.wait_ready()
-        except Exception as e:
-            print(f"  (couldn't commit final frame: {e})")
         renderer.stop()
         music.stop()
         # Finalize while the engine is still alive so the last frame persists.
