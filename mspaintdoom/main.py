@@ -34,11 +34,12 @@ class OnDemandRenderer:
     than the slower paste rate.
     """
 
-    def __init__(self, engine, scale, max_tics, poll_fn):
+    def __init__(self, engine, scale, max_tics, poll_fn, log_fn=lambda m: None):
         self._engine = engine
         self._scale = scale
         self._max_tics = max_tics
         self._poll = poll_fn                 # () -> action vector, per-tic input
+        self._log = log_fn
         self._latest_action = [0] * 9
         self._fires = 0                      # FIRE rising-edges since last read
         self._last = time.perf_counter()
@@ -53,8 +54,9 @@ class OnDemandRenderer:
             self._new_frame.set()                    # read is never empty
         except Exception:                            # (cold-start)
             pass
-        threading.Thread(target=self._push_loop, daemon=True,
-                         name="mspaintdoom-engine").start()
+        self._thread = threading.Thread(target=self._push_loop, daemon=True,
+                                        name="mspaintdoom-engine")
+        self._thread.start()
 
     def take_input_stats(self) -> "tuple[list[int], int]":
         """Latest per-tic action vector and FIRE rising-edges since last call —
@@ -69,24 +71,34 @@ class OnDemandRenderer:
         self._paused = paused
 
     def request_reset_sound(self) -> None:
-        self._reset_sound = True
+        with self._lock:
+            self._reset_sound = True
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = 2.0) -> None:
+        """Signal the engine thread and wait for it to leave engine.step(), so
+        the caller can close ViZDoom (which is not thread-safe) without racing an
+        in-flight step."""
         self._stop.set()
+        self._thread.join(timeout)
 
     def _step_encode(self) -> bytes:
         now = time.perf_counter()
         tics = min(self._max_tics, max(1, round((now - self._last) * TICRATE)))
         self._last = now
-        action = self._poll()  # sample input per tic, on the engine's clock
         with self._lock:
-            if action[4] and not self._latest_action[4]:
-                self._fires += 1
-            self._latest_action = action
-        if self._reset_sound:
-            self._reset_sound = False
+            reset, self._reset_sound = self._reset_sound, False
+        if reset:
             self._engine.reset_sound()
-        frame = self._engine.step(action, tics)
+        # Step one tic at a time, sampling input before each, so a catch-up burst
+        # doesn't apply a single input sample (or a stale tap) to all N tics.
+        frame = None
+        for _ in range(tics):
+            action = self._poll()  # per tic, on the engine's clock
+            with self._lock:
+                if action[4] and not self._latest_action[4]:
+                    self._fires += 1
+                self._latest_action = action
+            frame = self._engine.step(action, 1)
         return paint_out.encode_frame(frame, self._scale)  # immutable bytes
 
     def render_fn(self) -> bytes:
@@ -104,6 +116,7 @@ class OnDemandRenderer:
     def _push_loop(self) -> None:
         period = 1.0 / TICRATE
         nxt = time.perf_counter()
+        errors = 0
         while not self._stop.is_set():
             if not self._paused:
                 try:
@@ -111,8 +124,14 @@ class OnDemandRenderer:
                     with self._lock:
                         self._latest_dib = dib
                     self._new_frame.set()  # a tic advanced; a fresh frame is up
-                except Exception:
-                    pass
+                    errors = 0
+                except Exception as e:
+                    # Never silently spin forever: a persistent engine/encode
+                    # failure would just starve wait_new_frame with no trace in
+                    # the session log. Rate-limit so a transient hiccup is quiet.
+                    errors += 1
+                    if errors == 1 or errors % 200 == 0:
+                        self._log(f"renderer error #{errors}: {e!r}")
             nxt += period
             slack = nxt - time.perf_counter()
             if slack > 0:
@@ -332,7 +351,7 @@ def run() -> int:
     sfx_sampler = None if args.no_sound else music_mod.SessionPeakSampler()
     paste_misses = 0
     renderer = OnDemandRenderer(engine, paste_scale, MAX_TICS_PER_FRAME,
-                                keys.poll_action)
+                                keys.poll_action, log)
     # No frame timer: the loop is gated purely by engine tics + Paint readiness
     # (see the loop body), so it self-scales to the hardware.
     stat_t0 = time.perf_counter()
