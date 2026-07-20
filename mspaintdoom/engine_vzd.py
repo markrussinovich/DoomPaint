@@ -23,6 +23,18 @@ BUTTONS = (
 
 TICRATE = 35  # Doom's fixed simulation rate, tics per second
 
+# Selectable render resolutions. Smaller frames paste into Paint dramatically
+# faster (Paint's per-frame composite cost is pixel-bound): 320x200 — Doom's
+# authentic native resolution — roughly triples the achievable frame rate over
+# 640x400 with lower latency, at the cost of a chunkier (but period-accurate)
+# picture that Paint's fit-zoom scales up to the same on-screen size.
+RESOLUTIONS = {
+    "320x200": "RES_320X200",
+    "320x240": "RES_320X240",
+    "640x400": "RES_640X400",
+    "640x480": "RES_640X480",
+}
+
 
 def _suppress_engine_window(stop: threading.Event) -> None:
     """Hide ViZDoom's window the moment it's created.
@@ -43,7 +55,8 @@ def _suppress_engine_window(stop: threading.Event) -> None:
 
 class DoomEngine:
     def __init__(self, wad: int = 1, doom_map: str = "E1M1", skill: int = 3,
-                 sound: bool = True, game_wad: str | None = None):
+                 sound: bool = True, game_wad: str | None = None,
+                 resolution: str = "640x400"):
         self._game = g = vzd.DoomGame()
         wad_dir = os.path.dirname(vzd.__file__)
         # game_wad overrides the bundled Freedoom (e.g. shareware doom1.wad —
@@ -60,7 +73,8 @@ class DoomEngine:
         # renders much hotter than the engine's effects, so SFX need all the
         # headroom they can get (music is balanced via its session volume).
         g.add_game_args("+win_x -32000 +win_y -32000 +snd_sfxvolume 1")
-        g.set_screen_resolution(vzd.ScreenResolution.RES_640X400)
+        g.set_screen_resolution(
+            getattr(vzd.ScreenResolution, RESOLUTIONS[resolution]))
         g.set_screen_format(vzd.ScreenFormat.RGB24)
         g.set_window_visible(False)
         g.set_mode(vzd.Mode.PLAYER)

@@ -1,180 +1,234 @@
-"""Delayed-rendering clipboard owner: know exactly when Paint reads a frame.
+"""Clipboard owner backed by an OLE IDataObject — updated in place, never churned.
 
-Plain SetClipboardData at game speed races Paint's asynchronous paste:
-rewrite the clipboard while Paint is mid-read and Paint pops a modal "Can't
-complete operation" dialog that kills every later paste. Guessed settle
-timers can't fix this — paste latency varies wildly with frame size and
-Paint's mood (scale 2 blew through a 90 ms guard).
+Paint reads a pasted image off the clipboard asynchronously, on its own
+schedule. Rewriting the clipboard while that read is in flight makes it fail,
+and Paint responds with a modal "Can't complete operation" dialog that drops
+the paste. The raw-Win32 approach (a per-frame EmptyClipboard + SetClipboardData
+to re-arm) triggers exactly that: emptying the clipboard for the next frame
+frees the bytes out from under an in-progress read — intermittently, and more
+often the faster we paste.
 
-Delayed rendering flips the protocol. We advertise CF_DIB with a NULL handle;
-when Paint's paste actually reads the clipboard, Windows sends our hidden
-window WM_RENDERFORMAT and we hand over the bytes right then. That message is
-a positive signal the frame was consumed, so publish() can wait exactly as
-long as the previous paste needs before rewriting — no timing guesswork.
+So we stop rewriting the clipboard. We own it once as an OLE data object
+(OleSetClipboard with an IDataObject) and update the frame bytes it hands out
+in place. The object is reference-counted, so a consumer's in-flight read stays
+valid even as the next frame arrives — the race can't happen, and the dialog is
+gone. Each GetData call on our object doubles as a positive "frame was consumed"
+signal (the role WM_RENDERFORMAT played in the old delayed-render design), so
+publish() still paces against real consumption. On shutdown, OleFlushClipboard
+leaves the last frame pasteable.
 
-On shutdown, call finalize() to place real bytes on the clipboard, so quitting
-the game doesn't leave a dead delayed-render promise behind.
+The data object lives on a dedicated STA thread pumping messages, so the
+cross-process GetData calls are serviced promptly.
 """
 import atexit
-import ctypes
 import threading
-import time
-from ctypes import wintypes
 
-_user32 = ctypes.WinDLL("user32", use_last_error=True)
-_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+import pythoncom
+import win32api
+import win32event
+from win32com.server.exception import COMException
+from win32com.server.util import wrap
 
 CF_DIB = 8
-_GMEM_MOVEABLE = 0x0002
-_WM_RENDERFORMAT = 0x0305
-_WM_RENDERALLFORMATS = 0x0306
-_WM_DESTROYCLIPBOARD = 0x0307
-_HWND_MESSAGE = wintypes.HWND(-3)
-
-_WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT,
-                              wintypes.WPARAM, wintypes.LPARAM)
-
-
-class _WNDCLASSW(ctypes.Structure):
-    _fields_ = (("style", wintypes.UINT), ("lpfnWndProc", _WNDPROC),
-                ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
-                ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HICON),
-                ("hCursor", ctypes.c_void_p), ("hbrBackground", ctypes.c_void_p),
-                ("lpszMenuName", wintypes.LPCWSTR),
-                ("lpszClassName", wintypes.LPCWSTR))
+_DVASPECT_CONTENT = 1
+_TYMED_HGLOBAL = pythoncom.TYMED_HGLOBAL
+_DATADIR_GET = 1
+_DV_E_FORMATETC = -2147221404
+_E_NOTIMPL = -2147467263
+_OLE_E_ADVISENOTSUPPORTED = -2147221501
+_WM_QUIT = 0x0012
 
 
-for fn, res, args in (
-        (_user32.DefWindowProcW, ctypes.c_ssize_t,
-         (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)),
-        (_user32.CreateWindowExW, wintypes.HWND,
-         (wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
-          ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-          wintypes.HWND, ctypes.c_void_p, wintypes.HINSTANCE,
-          ctypes.c_void_p)),
-        (_user32.OpenClipboard, wintypes.BOOL, (wintypes.HWND,)),
-        (_user32.GetClipboardOwner, wintypes.HWND, ()),
-        (_user32.GetOpenClipboardWindow, wintypes.HWND, ()),
-        (_user32.SetClipboardData, wintypes.HANDLE,
-         (wintypes.UINT, wintypes.HANDLE)),
-        (_kernel32.GlobalAlloc, wintypes.HGLOBAL,
-         (wintypes.UINT, ctypes.c_size_t)),
-        (_kernel32.GlobalLock, ctypes.c_void_p, (wintypes.HGLOBAL,)),
-        (_kernel32.GlobalUnlock, wintypes.BOOL, (wintypes.HGLOBAL,)),
-        (_kernel32.GlobalFree, wintypes.HGLOBAL, (wintypes.HGLOBAL,)),
-        (_kernel32.GetModuleHandleW, wintypes.HMODULE, (wintypes.LPCWSTR,))):
-    fn.restype, fn.argtypes = res, args
+class _EnumFORMATETC:
+    """Minimal IEnumFORMATETC advertising just CF_DIB (HGLOBAL)."""
+
+    _com_interfaces_ = [pythoncom.IID_IEnumFORMATETC]
+    _public_methods_ = ["Next", "Skip", "Reset", "Clone"]
+
+    def __init__(self, fmts, index=0):
+        self._fmts = fmts
+        self._index = index
+
+    def Next(self, count):
+        result = self._fmts[self._index:self._index + count]
+        self._index += len(result)
+        return result
+
+    def Skip(self, count):
+        self._index += count
+        return 0
+
+    def Reset(self):
+        self._index = 0
+        return 0
+
+    def Clone(self):
+        return _new_enum(self._fmts, self._index)
+
+
+def _new_enum(fmts, index=0):
+    return wrap(_EnumFORMATETC(fmts, index), pythoncom.IID_IEnumFORMATETC)
+
+
+class _DibDataObject:
+    """IDataObject serving CF_DIB bytes from a provider callback.
+
+    QueryGetData/EnumFormatEtc advertise only CF_DIB; GetData returns the
+    current frame. Everything else returns a benign HRESULT so OLE treats it as
+    "format/operation not supported" rather than a hard error.
+    """
+
+    _com_interfaces_ = [pythoncom.IID_IDataObject]
+    _public_methods_ = ["GetData", "GetDataHere", "QueryGetData",
+                        "GetCanonicalFormatEtc", "SetData", "EnumFormatEtc",
+                        "DAdvise", "DUnadvise", "EnumDAdvise"]
+
+    def __init__(self, provider):
+        self._provider = provider  # zero-arg callable -> DIB bytes (or b"")
+
+    def QueryGetData(self, fe):
+        if fe[0] == CF_DIB and (fe[4] & _TYMED_HGLOBAL):
+            return 0  # S_OK
+        raise COMException(scode=_DV_E_FORMATETC)
+
+    def GetData(self, fe):
+        if fe[0] == CF_DIB and (fe[4] & _TYMED_HGLOBAL):
+            data = self._provider()
+            if data:
+                medium = pythoncom.STGMEDIUM()
+                medium.set(_TYMED_HGLOBAL, bytes(data))
+                return medium
+        raise COMException(scode=_DV_E_FORMATETC)
+
+    def EnumFormatEtc(self, direction):
+        if direction == _DATADIR_GET:
+            return _new_enum([(CF_DIB, None, _DVASPECT_CONTENT, -1,
+                               _TYMED_HGLOBAL)])
+        raise COMException(scode=_E_NOTIMPL)
+
+    def GetDataHere(self, *args):
+        raise COMException(scode=_E_NOTIMPL)
+
+    def GetCanonicalFormatEtc(self, *args):
+        raise COMException(scode=_E_NOTIMPL)
+
+    def SetData(self, *args):
+        raise COMException(scode=_E_NOTIMPL)
+
+    def DAdvise(self, *args):
+        raise COMException(scode=_OLE_E_ADVISENOTSUPPORTED)
+
+    def DUnadvise(self, *args):
+        raise COMException(scode=_OLE_E_ADVISENOTSUPPORTED)
+
+    def EnumDAdvise(self, *args):
+        raise COMException(scode=_OLE_E_ADVISENOTSUPPORTED)
 
 
 class ClipboardServer:
-    """Owns the clipboard via a message-only window on its own thread."""
+    """Owns the clipboard as an OLE IDataObject on a dedicated STA thread."""
 
     def __init__(self):
         self._dib = b""
-        self._render_ts = 0.0
+        self._last_good = b""  # last non-empty frame actually served
+        self._render_fn = None  # if set, called on demand to produce the DIB
         self._consumed = threading.Event()
         self._consumed.set()  # nothing pending yet
+        self._lock = threading.Lock()
         self._ready = threading.Event()
-        self._hwnd = None
-        self._proc = _WNDPROC(self._wndproc)  # keep alive: GC'd proc = crash
-        threading.Thread(target=self._pump, daemon=True,
-                         name="mspaintdoom-clip").start()
-        if not self._ready.wait(5.0) or not self._hwnd:
-            raise RuntimeError("clipboard server window failed to start")
+        self._tid = None
+        self._finalized = False
+        self._thread = threading.Thread(target=self._pump, daemon=True,
+                                        name="mspaintdoom-clip")
+        self._thread.start()
+        if not self._ready.wait(5.0):
+            raise RuntimeError("OLE clipboard server failed to start")
         atexit.register(self.finalize)
 
-    # -- worker thread ------------------------------------------------------
+    # -- OLE (STA) thread ---------------------------------------------------
+
+    def _provide(self):
+        """Called on the STA thread when Paint reads CF_DIB: produce (and, in
+        render-on-demand mode, generate) the freshest frame, and record that
+        Paint consumed it.
+
+        Never hands back an empty buffer. An empty read fails and pops Paint's
+        dialog, which is exactly the cold-start case (the first Ctrl+V can beat
+        the engine's first frame), so we fall back to the last good frame; and
+        we only flag consumption when real bytes actually went out."""
+        with self._lock:
+            fn = self._render_fn
+            data = fn() if fn is not None else self._dib
+            if data:
+                self._last_good = data
+            else:
+                data = self._last_good
+            if data:
+                self._consumed.set()  # consume edge is set under the same lock
+        return data
 
     def _pump(self):
-        cls = _WNDCLASSW()
-        cls.lpfnWndProc = self._proc
-        cls.hInstance = _kernel32.GetModuleHandleW(None)
-        cls.lpszClassName = "MsPaintDoomClipSrv"
-        _user32.RegisterClassW(ctypes.byref(cls))
-        self._hwnd = _user32.CreateWindowExW(
-            0, cls.lpszClassName, None, 0, 0, 0, 0, 0, _HWND_MESSAGE,
-            None, cls.hInstance, None)
+        self._tid = win32api.GetCurrentThreadId()
+        pythoncom.OleInitialize()
+        self._dataobj = wrap(_DibDataObject(self._provide),
+                             pythoncom.IID_IDataObject)
+        pythoncom.OleSetClipboard(self._dataobj)
         self._ready.set()
-        if not self._hwnd:
-            return
-        msg = wintypes.MSG()
-        while _user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            _user32.TranslateMessage(ctypes.byref(msg))
-            _user32.DispatchMessageW(ctypes.byref(msg))
-
-    def _wndproc(self, hwnd, msg, wparam, lparam):
-        if msg == _WM_RENDERFORMAT:
-            # Paint (or anyone) is reading our promise right now: deliver.
-            self._render(wparam or CF_DIB)
-            return 0
-        if msg == _WM_RENDERALLFORMATS:
-            if _user32.OpenClipboard(hwnd):
-                try:
-                    if _user32.GetClipboardOwner() == hwnd:
-                        self._render(CF_DIB)
-                finally:
-                    _user32.CloseClipboard()
-            return 0
-        if msg == _WM_DESTROYCLIPBOARD:
-            return 0  # our own EmptyClipboard on the next publish
-        return _user32.DefWindowProcW(hwnd, msg, wparam, lparam)
-
-    def _render(self, fmt):
-        data = self._dib
-        if data:
-            hmem = _kernel32.GlobalAlloc(_GMEM_MOVEABLE, len(data))
-            if hmem:
-                ptr = _kernel32.GlobalLock(hmem)
-                ctypes.memmove(ptr, data, len(data))
-                _kernel32.GlobalUnlock(hmem)
-                if not _user32.SetClipboardData(fmt, hmem):
-                    _kernel32.GlobalFree(hmem)
-        self._render_ts = time.perf_counter()
-        self._consumed.set()
+        # Message loop that also re-asserts clipboard ownership ~1x/sec. If the
+        # user (or any app) copies something while alt-tabbed, we lose the
+        # clipboard; without reacquiring we'd keep publishing to an object no
+        # longer on it, and Ctrl+V would paste their content, not the game frame.
+        # MsgWaitForMultipleObjects wakes immediately on Paint's GetData, so the
+        # ownership check adds no paste latency.
+        while True:
+            win32event.MsgWaitForMultipleObjects(
+                [], False, 1000, win32event.QS_ALLINPUT)
+            if pythoncom.PumpWaitingMessages():  # nonzero once WM_QUIT arrives
+                break
+            try:
+                if not pythoncom.OleIsCurrentClipboard(self._dataobj):
+                    pythoncom.OleSetClipboard(self._dataobj)
+            except Exception:
+                pass
+        try:
+            pythoncom.OleFlushClipboard()  # leave the last frame pasteable
+        except Exception:
+            pass
 
     # -- game-loop side -----------------------------------------------------
 
-    def publish(self, dib: bytes, wait_prev: float = 0.6) -> None:
-        """Advertise a new frame, first waiting for the previous one to be
-        consumed (WM_RENDERFORMAT seen) or wait_prev seconds, whichever
-        comes first. Timing out just means the last paste never happened
-        (dropped keystroke); overwriting is then safe by definition.
+    def publish(self, dib: bytes = None, wait_prev: float = 0.25,
+                render_fn=None) -> bool:
+        """Advertise a new frame, first waiting for the previous one to be read
+        by Paint (a GetData call) or wait_prev seconds, whichever comes first.
+        Returns whether that previous frame was consumed.
+
+        Pass `dib` for ready bytes, or `render_fn` (a zero-arg callable -> DIB
+        bytes) for render-on-demand: the frame is produced only when Paint's
+        GetData reads it, minimising displayed-frame age. Updating the data
+        object in place needs no clipboard churn, so a read still in flight is
+        never invalidated (that was the cause of Paint's clipboard-error dialog).
         """
-        self._consumed.wait(wait_prev)
-        # Paint touches the clipboard more than once per paste (format probe,
-        # then the actual insertion); WM_RENDERFORMAT marks only the first
-        # touch. Give the rest a beat before yanking the data away — a
-        # collision here is exactly what pops the "Can't complete operation"
-        # dialog.
-        since_render = time.perf_counter() - self._render_ts
-        if since_render < 0.06:
-            time.sleep(0.06 - since_render)
-        deadline = time.perf_counter() + 0.5
-        while _user32.GetOpenClipboardWindow() \
-                and time.perf_counter() < deadline:
-            time.sleep(0.005)  # someone (Paint) is mid-read: let them finish
-        for attempt in range(5):
-            if _user32.OpenClipboard(self._hwnd):
-                try:
-                    self._dib = dib
-                    self._consumed.clear()
-                    _user32.EmptyClipboard()
-                    _user32.SetClipboardData(CF_DIB, None)  # the promise
-                finally:
-                    _user32.CloseClipboard()
-                return
-            time.sleep(0.02)
-        raise RuntimeError("clipboard busy; frame dropped")
+        previous_consumed = self._consumed.wait(wait_prev)
+        with self._lock:
+            self._render_fn = render_fn
+            if dib is not None:
+                self._dib = dib
+            self._consumed.clear()  # arm "not yet consumed" atomically with data
+        return previous_consumed
 
     def finalize(self) -> None:
-        """Replace the delayed-render promise with real bytes (call on exit,
-        so the last frame survives us and other apps can still paste it)."""
-        data = self._dib
-        if not data or not _user32.OpenClipboard(self._hwnd):
+        """Stop the STA pump and wait for it to flush the last frame onto the
+        clipboard as a static copy. The join matters: the pump is a daemon
+        thread, so without waiting the process can exit and kill it before
+        OleFlushClipboard runs — leaving Paint's final read pointed at our dead
+        data object, which pops the "Can't complete operation" dialog on quit."""
+        if self._finalized:
             return
-        try:
-            if _user32.GetClipboardOwner() == self._hwnd:
-                _user32.EmptyClipboard()
-                self._render(CF_DIB)
-        finally:
-            _user32.CloseClipboard()
+        self._finalized = True
+        if self._tid:
+            try:
+                win32api.PostThreadMessage(self._tid, _WM_QUIT, 0, 0)
+            except Exception:
+                pass
+        self._thread.join(2.0)
