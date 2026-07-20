@@ -263,8 +263,9 @@ def run() -> int:
         print("Paste mode: UIA menu fallback (Ctrl+V didn't register here)")
 
     if args.scale == 0:
-        # Autofit: zoom the native-size canvas to fill the window, snapped to a
-        # crisp integer pixel ratio.
+        # Autofit: zoom the native-size canvas to fill the window, snapped so the
+        # scaled image lands on whole pixels (a round fraction, e.g. 225% — not
+        # necessarily an integer multiple).
         if original_zoom is not None:
             if key_paste_works:
                 zoom = paint_out.fit_canvas_zoom(hwnd)
