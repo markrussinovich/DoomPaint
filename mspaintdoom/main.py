@@ -29,14 +29,18 @@ class OnDemandRenderer:
 
     ViZDoom is not thread-safe, so the engine is only ever touched from this one
     thread. Paint's read gets the freshest finished frame (latency ~= one tic)
-    without stepping the simulation inside the read.
+    without stepping the simulation inside the read. Input is polled here once
+    per tic (via poll_fn), so control latency tracks the 35 Hz tic rate rather
+    than the slower paste rate.
     """
 
-    def __init__(self, engine, scale, max_tics):
+    def __init__(self, engine, scale, max_tics, poll_fn):
         self._engine = engine
         self._scale = scale
         self._max_tics = max_tics
-        self._action = [0] * 9
+        self._poll = poll_fn                 # () -> action vector, per-tic input
+        self._latest_action = [0] * 9
+        self._fires = 0                      # FIRE rising-edges since last read
         self._last = time.perf_counter()
         self._paused = False
         self._reset_sound = False
@@ -52,8 +56,12 @@ class OnDemandRenderer:
         threading.Thread(target=self._push_loop, daemon=True,
                          name="mspaintdoom-engine").start()
 
-    def set_action(self, action) -> None:
-        self._action = action
+    def take_input_stats(self) -> "tuple[list[int], int]":
+        """Latest per-tic action vector and FIRE rising-edges since last call —
+        for the game loop's input logging and silent-engine self-heal."""
+        with self._lock:
+            fires, self._fires = self._fires, 0
+            return list(self._latest_action), fires
 
     def set_paused(self, paused: bool) -> None:
         if self._paused and not paused:
@@ -70,10 +78,15 @@ class OnDemandRenderer:
         now = time.perf_counter()
         tics = min(self._max_tics, max(1, round((now - self._last) * TICRATE)))
         self._last = now
+        action = self._poll()  # sample input per tic, on the engine's clock
+        with self._lock:
+            if action[4] and not self._latest_action[4]:
+                self._fires += 1
+            self._latest_action = action
         if self._reset_sound:
             self._reset_sound = False
             self._engine.reset_sound()
-        frame = self._engine.step(self._action, tics)
+        frame = self._engine.step(action, tics)
         return paint_out.encode_frame(frame, self._scale)  # immutable bytes
 
     def render_fn(self) -> bytes:
@@ -318,7 +331,8 @@ def run() -> int:
     sound_resets = 0
     sfx_sampler = None if args.no_sound else music_mod.SessionPeakSampler()
     paste_misses = 0
-    renderer = OnDemandRenderer(engine, paste_scale, MAX_TICS_PER_FRAME)
+    renderer = OnDemandRenderer(engine, paste_scale, MAX_TICS_PER_FRAME,
+                                keys.poll_action)
     # No frame timer: the loop is gated purely by engine tics + Paint readiness
     # (see the loop body), so it self-scales to the hardware.
     stat_t0 = time.perf_counter()
@@ -342,10 +356,10 @@ def run() -> int:
             music.resume()
             renderer.set_paused(False)
 
-            action = keys.poll_action()
-            renderer.set_action(action)
-            if action[4] and not (last_action and last_action[4]):
-                fires_in_window += 1
+            # Input is now sampled per engine tic on the renderer thread; read
+            # the latest sample here for logging and the fire-edge self-heal.
+            action, fires = renderer.take_input_stats()
+            fires_in_window += fires
             if action != last_action:
                 pressed = [n for n, a in zip(
                     ("fwd", "back", "left", "right", "FIRE", "use", "run",
