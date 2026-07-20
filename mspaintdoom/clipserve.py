@@ -25,6 +25,7 @@ import threading
 
 import pythoncom
 import win32api
+import win32event
 from win32com.server.exception import COMException
 from win32com.server.util import wrap
 
@@ -155,15 +156,15 @@ class ClipboardServer:
         dialog, which is exactly the cold-start case (the first Ctrl+V can beat
         the engine's first frame), so we fall back to the last good frame; and
         we only flag consumption when real bytes actually went out."""
-        fn = self._render_fn
         with self._lock:
+            fn = self._render_fn
             data = fn() if fn is not None else self._dib
             if data:
                 self._last_good = data
             else:
                 data = self._last_good
-        if data:
-            self._consumed.set()
+            if data:
+                self._consumed.set()  # consume edge is set under the same lock
         return data
 
     def _pump(self):
@@ -173,7 +174,22 @@ class ClipboardServer:
                              pythoncom.IID_IDataObject)
         pythoncom.OleSetClipboard(self._dataobj)
         self._ready.set()
-        pythoncom.PumpMessages()  # until WM_QUIT; delivers Paint's GetData
+        # Message loop that also re-asserts clipboard ownership ~1x/sec. If the
+        # user (or any app) copies something while alt-tabbed, we lose the
+        # clipboard; without reacquiring we'd keep publishing to an object no
+        # longer on it, and Ctrl+V would paste their content, not the game frame.
+        # MsgWaitForMultipleObjects wakes immediately on Paint's GetData, so the
+        # ownership check adds no paste latency.
+        while True:
+            win32event.MsgWaitForMultipleObjects(
+                [], False, 1000, win32event.QS_ALLINPUT)
+            if pythoncom.PumpWaitingMessages():  # nonzero once WM_QUIT arrives
+                break
+            try:
+                if not pythoncom.OleIsCurrentClipboard(self._dataobj):
+                    pythoncom.OleSetClipboard(self._dataobj)
+            except Exception:
+                pass
         try:
             pythoncom.OleFlushClipboard()  # leave the last frame pasteable
         except Exception:
@@ -198,7 +214,7 @@ class ClipboardServer:
             self._render_fn = render_fn
             if dib is not None:
                 self._dib = dib
-        self._consumed.clear()
+            self._consumed.clear()  # arm "not yet consumed" atomically with data
         return previous_consumed
 
     def finalize(self) -> None:
