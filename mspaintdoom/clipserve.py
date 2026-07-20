@@ -137,8 +137,9 @@ class ClipboardServer:
         self._ready = threading.Event()
         self._tid = None
         self._finalized = False
-        threading.Thread(target=self._pump, daemon=True,
-                         name="mspaintdoom-clip").start()
+        self._thread = threading.Thread(target=self._pump, daemon=True,
+                                        name="mspaintdoom-clip")
+        self._thread.start()
         if not self._ready.wait(5.0):
             raise RuntimeError("OLE clipboard server failed to start")
         atexit.register(self.finalize)
@@ -201,8 +202,11 @@ class ClipboardServer:
         return previous_consumed
 
     def finalize(self) -> None:
-        """Stop the STA pump, which then flushes the last frame onto the
-        clipboard so quitting doesn't leave an empty clipboard behind."""
+        """Stop the STA pump and wait for it to flush the last frame onto the
+        clipboard as a static copy. The join matters: the pump is a daemon
+        thread, so without waiting the process can exit and kill it before
+        OleFlushClipboard runs — leaving Paint's final read pointed at our dead
+        data object, which pops the "Can't complete operation" dialog on quit."""
         if self._finalized:
             return
         self._finalized = True
@@ -211,3 +215,4 @@ class ClipboardServer:
                 win32api.PostThreadMessage(self._tid, _WM_QUIT, 0, 0)
             except Exception:
                 pass
+        self._thread.join(2.0)
