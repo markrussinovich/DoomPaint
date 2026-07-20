@@ -101,7 +101,7 @@ class OnDemandRenderer:
             frame = self._engine.step(action, 1)
         return paint_out.encode_frame(frame, self._scale)  # immutable bytes
 
-    def render_fn(self) -> bytes:
+    def latest_frame(self) -> bytes:
         with self._lock:
             return self._latest_dib
 
@@ -388,8 +388,8 @@ def run() -> int:
                     print(f"  input: {'+'.join(pressed) or '(none)'}")
                 last_action = action
             # Pace on the two things that actually gate a new frame — no timer:
-            #   (b) the engine advanced a tic (a fresh frame exists), and
-            #   (a) Paint finished reading the previous frame (publish() waits
+            #   (a) the engine advanced a tic (a fresh frame exists), and
+            #   (b) Paint finished reading the previous frame (publish() waits
             #       on its GetData below).
             # Their combination self-scales to the hardware: min(tic rate,
             # Paint's composite rate), with no rate constant to keep in sync.
@@ -397,7 +397,7 @@ def run() -> int:
                 continue  # engine produced nothing new (paused/stalled)
             try:
                 previous_consumed = paint_out.push_frame(
-                    paster, renderer.render_fn)
+                    paster, renderer.latest_frame)
             except paint_out.PaintNotFocusedError:
                 continue  # user tabbed away mid-frame; loop back to pause
             except Exception as e:

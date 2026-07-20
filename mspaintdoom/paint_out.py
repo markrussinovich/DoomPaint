@@ -231,18 +231,24 @@ def _zoom_percent(win) -> int:
     return int(values[0])
 
 
+def _ctrl_key(key: int) -> None:
+    """Send a Ctrl+<key> chord. Respects a player-held Ctrl (don't wrap our own
+    Ctrl press/release around the key — that would drop their held fire), and
+    clears the async tap latch our synthetic Ctrl leaves behind so the input
+    poll doesn't read it as a shot."""
+    if keys.ctrl_physically_down():
+        sendinput.send_keys((key, False), (key, True))
+    else:
+        sendinput.send_keys((keys.VK_CONTROL, False), (key, False),
+                            (key, True), (keys.VK_CONTROL, True))
+        keys.consume_tap(keys.VK_CONTROL)
+
+
 def _zoom_step(hwnd: int, win, key: int) -> bool:
     if not paint_is_foreground(hwnd):
         return False
     before = _zoom_percent(win)
-    ctrl_down = keys.ctrl_physically_down()
-    if ctrl_down:
-        sendinput.send_keys((key, False), (key, True))
-    else:
-        sendinput.send_keys(
-            (keys.VK_CONTROL, False), (key, False),
-            (key, True), (keys.VK_CONTROL, True))
-        keys.consume_tap(keys.VK_CONTROL)
+    _ctrl_key(key)
     for _ in range(40):
         time.sleep(0.05)
         if _zoom_percent(win) != before:
@@ -253,17 +259,9 @@ def _zoom_step(hwnd: int, win, key: int) -> bool:
 def _reset_zoom(hwnd: int, win) -> bool:
     if not paint_is_foreground(hwnd):
         return False
-    before = _zoom_percent(win)
-    if before == 100:
+    if _zoom_percent(win) == 100:
         return True
-    ctrl_down = keys.ctrl_physically_down()
-    if ctrl_down:
-        sendinput.send_keys((ord("0"), False), (ord("0"), True))
-    else:
-        sendinput.send_keys(
-            (keys.VK_CONTROL, False), (ord("0"), False),
-            (ord("0"), True), (keys.VK_CONTROL, True))
-        keys.consume_tap(keys.VK_CONTROL)
+    _ctrl_key(ord("0"))
     deadline = time.perf_counter() + 2.0
     while time.perf_counter() < deadline:
         time.sleep(0.05)
@@ -358,16 +356,17 @@ def fit_canvas_zoom(hwnd: int) -> int | None:
             time.sleep(0.02)
         time.sleep(0.2)
         view = win32gui.FindWindowEx(hwnd, 0, "MSPaintView", None)
-        current = _zoom_percent(win)
         width, height = _canvas_pixel_size(win)
-        exact_ratio = width * current % 100 == 0 \
-            and height * current % 100 == 0
-        while not exact_ratio or _margin_click_point(win, view) is None:
+
+        def whole_pixels(pct):  # the scaled image lands on whole pixels
+            return width * pct % 100 == 0 and height * pct % 100 == 0
+
+        current = _zoom_percent(win)
+        while not whole_pixels(current) \
+                or _margin_click_point(win, view) is None:
             if not _zoom_step(hwnd, win, _VK_PAGE_DOWN):
                 return None
             current = _zoom_percent(win)
-            exact_ratio = width * current % 100 == 0 \
-                and height * current % 100 == 0
         return current
     except Exception:
         return None
@@ -453,12 +452,6 @@ class _Paster:
     def fit_zoom_after_next_paste(self) -> None:
         self._fit_after_paste = True
 
-    def _after_paste(self) -> None:
-        if not self._fit_after_paste:
-            return
-        fit_canvas_zoom(self._hwnd)
-        self._fit_after_paste = False
-
     def set_zoom(self, percent: int) -> bool:
         """Set Paint's view zoom via the status-bar slider (best-effort).
 
@@ -530,18 +523,16 @@ class _Paster:
         if not self.paste_uncommitted():
             return
         if self._fit_after_paste:
-            if not self._wait_for_selection(True):
+            if not self._wait_for_selection():
                 raise RuntimeError("Paint did not create a pasted selection")
-            self._after_paste()
+            fit_canvas_zoom(self._hwnd)
+            self._fit_after_paste = False
 
-    def _selection_is_active(self) -> bool:
-        return self._crop.is_enabled()
-
-    def _wait_for_selection(self, active: bool,
-                            timeout: float = 0.6) -> bool:
+    def _wait_for_selection(self, timeout: float = 0.6) -> bool:
+        """Wait until a floating selection appears (Paint's Crop button enables)."""
         deadline = time.perf_counter() + timeout
         while time.perf_counter() < deadline:
-            if self._selection_is_active() == active:
+            if self._crop.is_enabled():
                 return True
             time.sleep(0.002)
         return False
@@ -579,6 +570,7 @@ class MenuPaster(_Paster):
                     pass
                 time.sleep(0.05)
         return False
+
 
 def _window_changed(before: "Image.Image | None",
                     after: "Image.Image | None") -> bool:
