@@ -45,7 +45,11 @@ Options: `--map E1M2`, `--wad 2` (Freedoom Phase 2, maps `MAP01`+), `--scale 2`,
 `--skill 1..5`, `--no-sound` (all audio off), `--no-music` (keep sound
 effects, skip the soundtrack), `--music-volume 0..100` (default 40 — the
 MIDI synth runs much hotter than the engine's effects), `--music-wad PATH`
-(soundtrack from another WAD).
+(soundtrack from another WAD),
+`--res 320x200|320x240|640x400|640x480` (default `640x400`;
+`320x200` is Doom's native res and pastes ~3× faster, `320x240` is the
+aspect-correct 4:3 view — see **How it works**),
+`--render-mode push|pull|eager` (default `push`; see **How it works**).
 
 **Game data & soundtrack**: `wad\doom1.wad` — the freely-distributable
 shareware episode — is both the game data and the source of the real Bobby
@@ -81,25 +85,76 @@ echoes registered inputs to the console live.
      (The self-test is genuinely load-bearing: some Paint builds drop most
      synthetic Ctrl+V chords, and which path wins can vary run to run.)
 
-   A pasted image lands as a *floating selection* that obeys arrow keys and
-   pops a mini-toolbar, so each frame is immediately **committed** by switching
-   to the Brushes tool via UIA — flattening it onto the canvas without drawing.
-   (Best-effort: if the toolbar is hidden the button doesn't exist; frames
-   then paste uncommitted rather than crashing.)
+   A pasted image lands as a *floating selection*. The next paste implicitly
+   commits it, preserving one Undo step per frame without a separate flattening
+   action. The low-level input hook prevents gameplay keys from moving the
+   selection; the last frame is committed with one outside-canvas click when
+   the game exits.
 
-   Clipboard discipline matters at 10 fps: Paint processes each paste
-   asynchronously, and rewriting the clipboard while Paint is still reading it
-   pops a modal **"Can't complete operation"** error that silently kills every
-   subsequent paste. Fixed timers can't close that race (paste latency varies
-   wildly with frame size), so frames are published with **clipboard delayed
-   rendering**: the clipboard advertises CF_DIB with a NULL handle, and when
-   Paint's paste actually reads it, Windows asks us to render via
-   `WM_RENDERFORMAT` — a positive signal the frame was consumed. The next
-   frame is only published after that signal (or a generous timeout, which
-   just means the paste keystroke was dropped). A watchdog still dismisses
-   the dialog if it ever appears and demotes Ctrl+V to the menu paster if
-   pastes stop landing; on exit the promise is swapped for real bytes so the
-   last frame stays pasteable.
+   Before the first paste, the canvas's bottom-right resize handle is
+   synthetically dragged to make it 1×1 pixel. If the handle is offscreen above
+   100% zoom, Ctrl+0 resets directly to 100%; Ctrl+PageDown continues lower only
+   if needed. Paint then auto-expands the canvas to the exact frame dimensions
+   on the first paste. Paint's Fit to
+   window button then chooses the largest visible scale; if that produces
+   fractional display dimensions, one or more Ctrl+PageDown steps select the
+   nearest exact ratio with a clickable margin. At sub-100% zoom, the drag may
+   land a few pixels above 1×1; any result smaller than the incoming frame is
+   sufficient. This avoids both a resize dialog and a separate startup crop.
+
+   Clipboard discipline matters here: Paint processes each paste asynchronously,
+   reading the image off the clipboard on its own schedule. Rewriting the
+   clipboard while that read is still in flight makes the read fail, and Paint
+   responds with a modal **"Can't complete operation"** error that silently
+   kills the paste. We hit this constantly with the naive approach — calling
+   `EmptyClipboard`/`SetClipboardData` for every frame — because emptying the
+   clipboard to re-arm the next frame frees the bytes out from under Paint's
+   in-progress read. Fixed settle timers can't close that race (paste latency
+   varies wildly with frame size).
+
+   The fix is to stop rewriting the clipboard at all. Windows lets you own the
+   clipboard as an OLE data object (`OleSetClipboard` with an `IDataObject`)
+   instead of pushing a fresh handle each time; consumers read it by calling
+   `IDataObject::GetData`. We publish one such object once and update the frame
+   bytes it hands out **in place**. The object is reference-counted, so a read
+   still in flight stays valid even as the next frame arrives — the race simply
+   can't occur, and the dialog is gone. Each `GetData` call doubles as our
+   positive "frame was consumed" signal, so the next frame is only published
+   after that signal (or a generous timeout, which just means the paste
+   keystroke was dropped). Eight consecutive missed consumption signals trigger
+   the UIA menu fallback. On exit `OleFlushClipboard` leaves the last frame
+   pasteable.
+
+   Paint's per-frame cost is dominated by pixel count, not per-paste overhead,
+   so frame **resolution** is the biggest lever on smoothness. The default
+   640×400 tops out around 20 fps here; `--res 320x200` (Doom's authentic
+   native resolution) quarters the pixels and roughly doubles that ceiling, so
+   it runs right up at Doom's 35 Hz tic rate. (Driving 320×200 that fast used
+   to make Paint raise its clipboard-error dialog every ~30–40 s; the OLE
+   in-place clipboard above removes that race entirely, so it's now dialog-free
+   even at full rate.) `320x200` has square pixels, so it looks horizontally
+   stretched; `--res 320x240` is the aspect-correct 4:3 view (how Doom looked on
+   a CRT). Paint's Fit-to-window zoom scales whichever frame back up to the same
+   on-screen size.
+
+   **Pacing needs no tuned frame rate.** Two things gate a new frame, and the
+   loop simply waits for both: (a) Paint has finished reading the previous
+   frame (the `GetData` "consumed" signal above), and (b) the engine has
+   advanced a tic (a genuinely new frame exists). Waiting on (a) means we never
+   outrun Paint's compositor; waiting on (b) means we never paste the same
+   frame twice. Their combination is self-clocking — the effective rate is
+   `min(35 Hz tic rate, this machine's Paint composite rate)` with no constant
+   to tune, so it scales to the hardware automatically (faster PC → faster, up
+   to 35; slower PC → slower).
+
+   By default (`--render-mode push`) the engine runs on its own thread at
+   Doom's native 35 Hz, and Paint's clipboard read (its `GetData` call) is
+   answered with the *freshest* finished frame the instant it reads — so what
+   appears reflects the current game state rather than the one queued when the
+   Ctrl+V was sent, measurably lowering on-screen latency. `--render-mode pull`
+   goes further, stepping the engine *inside* the read for the lowest latency,
+   at the cost of tying the simulation cadence to Paint's jittery reads; `eager`
+   is the legacy path that binds and encodes each frame at submit time.
 3. **Sound** — effects come from the engine itself (ViZDoom plays them through
    OpenAL on the default device; the sfx volume is pinned at launch because
    ZDoom persists cvars to `_vizdoom.ini`, and a stale zero would mute every
@@ -142,15 +197,15 @@ echoes registered inputs to the console live.
 
 **The commit never uses a synthetic Esc.** An earlier version committed with
 Esc — but while you hold Ctrl to fire, that Esc becomes **Ctrl+Esc**, which
-opens the Windows Start menu, steals focus, and freezes the game. Committing by
-switching tools (a UIA button invoke, not a keystroke) avoids that chord, and
-the Ctrl+V path avoids opening any menu that could eat your keys.
+opens the Windows Start menu, steals focus, and freezes the game. The
+outside-canvas click avoids keyboard chords entirely, and the Ctrl+V path
+avoids opening any menu that could eat gameplay keys.
 
 ## Files
 
 - `mspaintdoom/` — the app: `main.py` (loop), `engine_vzd.py` (ViZDoom
   wrapper), `paint_out.py` (Paint window mgmt, pasting, watchdogs),
-  `clipserve.py` (delayed-rendering clipboard owner), `keys.py` (keyboard
+  `clipserve.py` (OLE `IDataObject` clipboard owner), `keys.py` (keyboard
   hook + polling), `music.py` (WAD music → MIDI, audio plumbing),
   `sendinput.py`, `capture.py`
 - `wad\doom1.wad` — shareware DOOM (game data + episode 1 soundtrack)

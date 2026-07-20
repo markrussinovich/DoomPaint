@@ -41,6 +41,7 @@ _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN = 0x25, 0x26, 0x27, 0x28
 VK_SHIFT, VK_CONTROL = 0x10, 0x11
+VK_LSHIFT, VK_RSHIFT = 0xA0, 0xA1
 VK_SPACE = 0x20
 VK_OEM_COMMA, VK_OEM_PERIOD = 0xBC, 0xBE
 VK_F12 = 0x7B
@@ -221,3 +222,15 @@ def quit_requested() -> bool:
 
 def ctrl_physically_down() -> bool:
     return _held(VK_CONTROL)
+
+
+def held_shift_vks() -> list[int]:
+    """Which specific Shift keys are physically down right now.
+
+    Paint reads modifiers globally (GetAsyncKeyState), so a held Shift (the run
+    key) turns an injected Ctrl+V into Ctrl+Shift+V — not Paint's paste
+    accelerator. The paster clears these for the paste chord, then re-presses
+    them. LSHIFT/RSHIFT are checked specifically because injecting the generic
+    VK_SHIFT would not clear the async state of the actual held key.
+    """
+    return [vk for vk in (VK_LSHIFT, VK_RSHIFT) if _held(vk)]

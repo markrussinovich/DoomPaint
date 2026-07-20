@@ -10,21 +10,114 @@ import sys
 import threading
 import time
 
-import numpy as np
-
-from . import capture, keys, paint_out
+from . import keys, paint_out
 from . import music as music_mod
 from .engine_vzd import TICRATE, DoomEngine
 from .music import MusicPlayer
 
 MAX_TICS_PER_FRAME = 7  # cap catch-up so slow pastes slow the game, not warp it
 
-# Ctrl+V pastes can silently stop registering in some Paint builds even after
-# passing the boot self-test. Every N frames, compare the Paint window to the
-# previous check; if the engine kept producing new frames but the canvas froze
-# for STRIKES consecutive checks, demote to the (slower, reliable) menu paster.
-PASTE_CHECK_EVERY = 10
-PASTE_STALE_STRIKES = 2
+
+# Delayed clipboard rendering tells us directly whether Paint requested the
+# previous frame. Only demote after a sustained run of dropped Ctrl+V pastes.
+PASTE_MISSES_BEFORE_FALLBACK = 8
+
+
+class OnDemandRenderer:
+    """Produce the frame at the moment Paint reads the clipboard.
+
+    The engine is only ever touched from ONE thread (ViZDoom is not
+    thread-safe):
+      * pull  -> engine.step runs inside the clipboard render callback, so the
+                 displayed frame is generated the instant Paint reads it
+                 (lowest latency, but the simulation only advances on reads).
+      * push  -> a dedicated engine thread free-runs at the tic rate; the read
+                 callback just returns the most recent pre-encoded frame
+                 (smooth simulation, latency ~= one tic).
+    """
+
+    def __init__(self, engine, scale, mode, max_tics):
+        self._engine = engine
+        self._scale = scale
+        self._mode = mode
+        self._max_tics = max_tics
+        self._action = [0] * 9
+        self._last = time.perf_counter()
+        self._paused = False
+        self._reset_sound = False
+        self._latest_dib = b""
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._new_frame = threading.Event()  # set when a fresh tic frame exists
+        if mode == "push":
+            try:
+                self._latest_dib = self._step_encode()  # seed so the very
+                self._new_frame.set()                    # first read is never
+            except Exception:                            # empty (cold-start)
+                pass
+            threading.Thread(target=self._push_loop, daemon=True,
+                             name="mspaintdoom-engine").start()
+
+    def set_action(self, action) -> None:
+        self._action = action
+
+    def set_paused(self, paused: bool) -> None:
+        if self._paused and not paused:
+            self._last = time.perf_counter()  # don't bank time spent paused
+        self._paused = paused
+
+    def request_reset_sound(self) -> None:
+        self._reset_sound = True
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _step_encode(self) -> bytes:
+        now = time.perf_counter()
+        tics = min(self._max_tics, max(1, round((now - self._last) * TICRATE)))
+        self._last = now
+        if self._reset_sound:
+            self._reset_sound = False
+            self._engine.reset_sound()
+        frame = self._engine.step(self._action, tics)
+        return paint_out.encode_frame(frame, self._scale)  # immutable bytes
+
+    def render_fn(self) -> bytes:
+        if self._mode == "pull":
+            return self._step_encode()
+        with self._lock:
+            return self._latest_dib
+
+    def wait_new_frame(self, timeout: float) -> bool:
+        """Block until the engine has produced a new frame (i.e. a tic
+        advanced), so the paste loop never submits faster than the simulation
+        actually moves — the tic rate is the cap, with no separate constant to
+        keep in sync. In pull mode the frame is rendered inside Paint's read, so
+        every read is inherently fresh and this returns at once."""
+        if self._mode != "push":
+            return True
+        got = self._new_frame.wait(timeout)
+        self._new_frame.clear()
+        return got
+
+    def _push_loop(self) -> None:
+        period = 1.0 / TICRATE
+        nxt = time.perf_counter()
+        while not self._stop.is_set():
+            if not self._paused:
+                try:
+                    dib = self._step_encode()
+                    with self._lock:
+                        self._latest_dib = dib
+                    self._new_frame.set()  # a tic advanced; a fresh frame is up
+                except Exception:
+                    pass
+            nxt += period
+            slack = nxt - time.perf_counter()
+            if slack > 0:
+                time.sleep(slack)
+            else:
+                nxt = time.perf_counter()
 
 
 def run() -> int:
@@ -34,6 +127,13 @@ def run() -> int:
                     help="1=Freedoom Phase 1, 2=Phase 2")
     ap.add_argument("--scale", type=int, default=1, choices=(1, 2),
                     help="integer upscale of the 640x400 frame")
+    ap.add_argument("--res", choices=("320x200", "320x240", "640x400",
+                                      "640x480"), default="640x400",
+                    help="engine render resolution (default 640x400). "
+                         "320x200 is Doom's native res and pastes ~2.5x faster "
+                         "(up to the 35 Hz tic rate), but square pixels look "
+                         "stretched; 320x240 is the aspect-correct 4:3 view "
+                         "(~20 fps); 640x* are sharp but slow (~11-13 fps)")
     ap.add_argument("--skill", type=int, default=3, choices=range(1, 6))
     ap.add_argument("--no-sound", action="store_true",
                     help="disable all audio (effects and music)")
@@ -47,6 +147,14 @@ def run() -> int:
                          "commercial doom.wad you own for the original "
                          "tracks (wad\\doom.wad / wad\\doom2.wad are "
                          "auto-detected). Game data stays Freedoom.")
+    ap.add_argument("--render-mode", choices=("eager", "pull", "push"),
+                    default="push",
+                    help="when to produce each frame: 'push' (default) "
+                         "free-runs the engine on its own thread and serves "
+                         "the freshest frame on Paint's clipboard read; 'pull' "
+                         "runs the engine inside the read (lowest latency, but "
+                         "the simulation only advances on reads); 'eager' "
+                         "encodes at submit time (legacy behaviour)")
     args = ap.parse_args()
 
     # Session log: what the game actually saw, for post-mortem diagnosis.
@@ -59,6 +167,7 @@ def run() -> int:
         session_log.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
 
     log(f"boot args={vars(args)}")
+    log("pacing: engine-tic + Paint-readiness (no rate cap)")
 
     # Game data: prefer the real (shareware) DOOM WAD when it covers the
     # requested map — shareware is episode 1 only; Freedoom fills the rest.
@@ -73,7 +182,8 @@ def run() -> int:
         print("Booting Doom (this is real Doom; the WAD is Freedoom)...")
     log(f"game wad: {game_wad or 'freedoom'}")
     engine = DoomEngine(wad=args.wad, doom_map=args.map, skill=args.skill,
-                        sound=not args.no_sound, game_wad=game_wad)
+                        sound=not args.no_sound, game_wad=game_wad,
+                        resolution=args.res)
     device_changed_at = [0.0]
     if not args.no_sound:
         status = music_mod.audio_output_status()
@@ -127,6 +237,7 @@ def run() -> int:
         threading.Thread(target=music_boot, daemon=True,
                          name="music-boot").start()
     print("Finding MS Paint...")
+    print("Paste pacing: engine-tic paced (scales to your hardware)")
     hwnd = paint_out.launch_paint()
     paint_out.focus_paint(hwnd)
 
@@ -134,26 +245,40 @@ def run() -> int:
     if paint_out.dismiss_error_dialog(hwnd):
         print("Dismissed a leftover Paint error dialog.")
     paint_out.start_error_watchdog(hwnd)
+    disp_w = frame0.shape[1] * args.scale
+    disp_h = frame0.shape[0] * args.scale
+    canvas_prime = paint_out.prime_canvas(hwnd, disp_w, disp_h)
+    if canvas_prime is not None:
+        original_zoom, primed_w, primed_h = canvas_prime
+        print(f"Canvas primed at {primed_w}x{primed_h} "
+              f"(first paste expands to "
+              f"{disp_w}x{disp_h})")
+        log(f"canvas primed at {primed_w}x{primed_h} for "
+            f"{disp_w}x{disp_h} frames "
+            f"(original zoom: {original_zoom}%)")
+    else:
+        original_zoom = None
+        print("  (couldn't prime the canvas — frames will still auto-grow it)")
+        log("canvas priming failed")
+
     # Prefer Ctrl+V (opens no menu, never diverts the player's keystrokes); fall
     # back to the Edit>Paste menu only if synthetic keys don't reach this Paint.
-    # Either way, commit is via the Brushes tool, never a synthetic Esc.
-    if paint_out.key_paste_lands(hwnd):
+    # A subsequent paste commits the previous floating selection automatically.
+    key_paste_works = paint_out.key_paste_lands(hwnd, disp_w, disp_h)
+    if key_paste_works:
         paster = paint_out.KeyPaster(hwnd)
         print("Paste mode: Ctrl+V (no menus)")
     else:
         paster = paint_out.MenuPaster(hwnd)
         print("Paste mode: UIA menu fallback (Ctrl+V didn't register here)")
-
-    # Size the canvas to exactly the Doom display, so frames fill it edge to
-    # edge with no leftover white margins.
-    disp_w = frame0.shape[1] * args.scale
-    disp_h = frame0.shape[0] * args.scale
-    if paster.size_canvas(disp_w, disp_h):
-        print(f"Canvas sized to the Doom display ({disp_w}x{disp_h})")
-        log(f"canvas sized to {disp_w}x{disp_h}")
-    else:
-        print("  (couldn't size the canvas — frames will still auto-grow it)")
-        log("canvas sizing failed")
+    if original_zoom is not None:
+        if key_paste_works:
+            restored_zoom = paint_out.fit_canvas_zoom(hwnd)
+            if restored_zoom is not None:
+                print(f"Canvas fitted at {restored_zoom}%")
+                log(f"canvas zoom fitted to {restored_zoom}%")
+        else:
+            paster.fit_zoom_after_next_paste()
 
     # Capture game keys before Paint sees them: a stray arrow key in Paint
     # dismisses the paste menu / drags the pasted selection and stalls frames.
@@ -177,10 +302,15 @@ def run() -> int:
     fires_in_window = 0
     sound_resets = 0
     sfx_sampler = None if args.no_sound else music_mod.SessionPeakSampler()
-    stale_strikes = 0
-    engine_moved = False
-    prev_frame = None
-    check_img = None
+    paste_misses = 0
+    renderer = None
+    if args.render_mode != "eager":
+        renderer = OnDemandRenderer(engine, args.scale, args.render_mode,
+                                    MAX_TICS_PER_FRAME)
+        print(f"Render mode: {args.render_mode} (frame produced on Paint's "
+              f"clipboard read)")
+    # No frame timer: the loop is gated purely by engine tics + Paint readiness
+    # (see the loop body), so it self-scales to the hardware.
     stat_t0 = time.perf_counter()
     last = time.perf_counter()
     try:
@@ -194,6 +324,8 @@ def run() -> int:
                     log("paused (Paint lost focus)")
                     was_paused = True
                 music.pause()
+                if renderer:
+                    renderer.set_paused(True)
                 last = time.perf_counter()  # don't bank time while paused
                 time.sleep(0.10)
                 continue
@@ -201,8 +333,12 @@ def run() -> int:
                 log("resumed (Paint focused)")
                 was_paused = False
             music.resume()
+            if renderer:
+                renderer.set_paused(False)
 
             action = keys.poll_action()
+            if renderer:
+                renderer.set_action(action)
             if action[4] and not (last_action and last_action[4]):
                 fires_in_window += 1
             if action != last_action:
@@ -214,14 +350,25 @@ def run() -> int:
                     print(f"  input: {'+'.join(pressed) or '(none)'}")
                 last_action = action
             now = time.perf_counter()
-            tics = min(MAX_TICS_PER_FRAME, max(1, round((now - last) * TICRATE)))
-            last = now
-            frame = engine.step(action, tics)
-            if prev_frame is not None and not np.array_equal(frame, prev_frame):
-                engine_moved = True
-            prev_frame = frame
+            if renderer is None:
+                tics = min(MAX_TICS_PER_FRAME,
+                           max(1, round((now - last) * TICRATE)))
+                last = now
+                frame = engine.step(action, tics)
+            else:
+                frame = None  # produced on demand when Paint reads
+            # Pace on the two things that actually gate a new frame — no timer:
+            #   (b) the engine advanced a tic (a fresh frame exists), and
+            #   (a) Paint finished reading the previous frame (publish() waits
+            #       on its GetData below).
+            # Their combination self-scales to the hardware: min(tic rate,
+            # Paint's composite rate), with no rate constant to keep in sync.
+            if renderer is not None and not renderer.wait_new_frame(0.25):
+                continue  # engine produced nothing new (paused/stalled)
             try:
-                paint_out.push_frame(hwnd, frame, paster, scale=args.scale)
+                previous_consumed = paint_out.push_frame(
+                    hwnd, frame, paster, scale=args.scale,
+                    render_fn=(renderer.render_fn if renderer else None))
             except paint_out.PaintNotFocusedError:
                 continue  # user tabbed away mid-frame; loop back to pause
             except Exception as e:
@@ -250,39 +397,50 @@ def run() -> int:
                             f"#{sound_resets}")
                         print("  (engine audio is silent — resetting the "
                               "engine sound system)")
-                        engine.reset_sound()
+                        if renderer:
+                            renderer.request_reset_sound()
+                        else:
+                            engine.reset_sound()
                     fires_in_window = 0
-            if total_frames % PASTE_CHECK_EVERY == 0:
-                img = capture.grab_window(hwnd)
-                if img is not None:
-                    if engine_moved and paint_out.window_stale(check_img, img):
-                        # Frames aren't landing. Usual suspect: the modal
-                        # "Can't complete operation" clipboard-error dialog.
+            if isinstance(paster, paint_out.KeyPaster):
+                if previous_consumed:
+                    paste_misses = 0
+                else:
+                    paste_misses += 1
+                    paint_out.arm_error_watchdog()
+                    log(f"Ctrl+V clipboard miss {paste_misses}/"
+                        f"{PASTE_MISSES_BEFORE_FALLBACK}")
+                    if paste_misses >= PASTE_MISSES_BEFORE_FALLBACK:
                         if paint_out.dismiss_error_dialog(hwnd):
                             print("  (dismissed Paint's clipboard-error "
-                                  "dialog)")
-                            stale_strikes = 0
-                        elif isinstance(paster, paint_out.KeyPaster):
-                            stale_strikes += 1
-                            if stale_strikes >= PASTE_STALE_STRIKES:
-                                print("Ctrl+V pastes stopped landing — "
-                                      "switching to the UIA menu paster.")
-                                paster = paint_out.MenuPaster(hwnd)
-                                stale_strikes = 0
-                    else:
-                        stale_strikes = 0
-                    check_img = img
-                    engine_moved = False
+                                  "dialog; retrying Ctrl+V)")
+                            paste_misses = 0
+                        else:
+                            print("Ctrl+V missed "
+                                  f"{PASTE_MISSES_BEFORE_FALLBACK} "
+                                  "consecutive pastes — switching to the "
+                                  "UIA menu paster.")
+                            paster = paint_out.MenuPaster(hwnd)
+                            paste_misses = 0
             if frames % 50 == 0:
                 dt = time.perf_counter() - stat_t0
-                print(f"  {frames / dt:4.1f} fps (paint-side)")
+                print(f"  {frames / dt:4.1f} pastes/s submitted")
                 frames, stat_t0 = 0, time.perf_counter()
     except KeyboardInterrupt:
         return 0
     finally:
+        try:
+            paster.commit_existing_selection()
+            paster.wait_ready()
+        except Exception as e:
+            print(f"  (couldn't commit final frame: {e})")
+        if renderer:
+            renderer.stop()
         music.stop()
+        # Finalize while the engine is still alive: in pull mode this renders
+        # one last real frame on demand instead of leaving a dead promise.
+        paint_out.release_clipboard()
         engine.close()
-        paint_out.release_clipboard()  # leave real bytes, not a dead promise
         print("Doom has left the canvas.")
 
 
