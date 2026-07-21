@@ -324,6 +324,9 @@ def run() -> int:
         while hwnd is None:
             if keys.quit_requested():
                 print("F12 — quitting.")
+                music.stop()
+                engine.close()
+                session_log.close()
                 return 0
             hwnd = paint_out.find_paint()
             if hwnd is None:
@@ -336,6 +339,9 @@ def run() -> int:
             if keys.quit_requested():
                 print("F12 — quitting.")
                 saveload_watcher.close()
+                music.stop()
+                engine.close()
+                session_log.close()
                 return 0
             load_path = saveload_watcher.take_pending_load()
             if load_path:
@@ -506,7 +512,7 @@ def run() -> int:
             # around. Skip pasting this frame instead of fighting them for
             # the menu bar -- canvas_has_focus can't see this (these are
             # non-activating popups that don't change the foreground window).
-            if paint_out.has_open_popup(hwnd):
+            if isinstance(paster, paint_out.MenuPaster) and paint_out.has_open_popup(hwnd):
                 time.sleep(0.05)
                 continue
 

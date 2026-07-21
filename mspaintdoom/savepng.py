@@ -20,22 +20,23 @@ _KEYWORD = "DoomPaintSave"
 
 def embed_save(png_path: str, zds_bytes: bytes) -> None:
     """Rewrite the PNG at png_path in place, adding zds_bytes as metadata."""
-    img = Image.open(png_path)
-    img.load()  # pull in pixel data (and any trailing chunks) before rewriting
+    with Image.open(png_path) as img:
+        img.load()  # pull in pixel data (and any trailing chunks) before rewriting
+        text = dict(getattr(img, "text", {}))
+        img2 = img.copy()
     info = PngInfo()
-    for key, value in getattr(img, "text", {}).items():
+    for key, value in text.items():
         if key != _KEYWORD:
             info.add_text(key, value)
-    info.add_text(_KEYWORD, base64.b64encode(zds_bytes).decode("ascii"),
-                 zip=True)
-    img.save(png_path, pnginfo=info)
+    info.add_text(_KEYWORD, base64.b64encode(zds_bytes).decode("ascii"), zip=True)
+    img2.save(png_path, pnginfo=info)
 
 
 def extract_save(png_path: str) -> "bytes | None":
     """Return the embedded .zds bytes, or None if this PNG has none."""
-    img = Image.open(png_path)
-    img.load()  # trailing text chunks aren't parsed until the image loads
-    b64 = getattr(img, "text", {}).get(_KEYWORD)
+    with Image.open(png_path) as img:
+        img.load()  # trailing text chunks aren't parsed until the image loads
+        b64 = getattr(img, "text", {}).get(_KEYWORD)
     if not b64:
         return None
     return base64.b64decode(b64)

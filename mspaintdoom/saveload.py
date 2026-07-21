@@ -163,9 +163,12 @@ class SaveLoadWatcher:
         threading.Thread(target=self._run, daemon=True,
                          name="mspaintdoom-saveload-watch").start()
 
-    def _run(self) -> None:
+def _run(self) -> None:
+    inited = False
+    try:
         try:
             pythoncom.CoInitialize()
+            inited = True
         except OSError:
             pass
         while not self._stop.is_set():
@@ -175,7 +178,12 @@ class SaveLoadWatcher:
             except Exception:
                 pass  # a watcher hiccup must never take down the game loop
             time.sleep(_POLL_INTERVAL)
-
+    finally:
+        if inited:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
     def _poll_dialogs(self) -> None:
         for title, kind in _DIALOG_TITLES:
             if self._stop.is_set():
