@@ -18,6 +18,7 @@ from .engine_vzd import TICRATE, DoomEngine
 from .music import MusicPlayer
 
 MAX_TICS_PER_FRAME = 7  # cap catch-up so slow pastes slow the game, not warp it
+PAINT_FPS_CAP = 30  # pastes beyond this just burn Paint's UI thread
 
 # Ctrl+V pastes can silently stop registering in some Paint builds even after
 # passing the boot self-test. Every N frames, compare the Paint window to the
@@ -209,6 +210,7 @@ def run() -> int:
     check_img = None
     stat_t0 = time.perf_counter()
     last = time.perf_counter()
+    next_frame = time.perf_counter()
     try:
         while True:
             if keys.quit_requested():
@@ -257,6 +259,15 @@ def run() -> int:
                 if dropped % 25 == 1:
                     print(f"  (frame dropped: {type(e).__name__}: {e})")
                 continue
+
+            # Pace the push rate: the engine still simulates real time (tics
+            # are wall-clock), this only caps how often Paint repaints.
+            next_frame += 1.0 / PAINT_FPS_CAP
+            now = time.perf_counter()
+            if now < next_frame:
+                time.sleep(next_frame - now)
+            else:
+                next_frame = now  # fell behind; don't bank a deficit
 
             frames += 1
             total_frames += 1
@@ -308,7 +319,7 @@ def run() -> int:
     finally:
         music.stop()
         engine.close()
-        paint_out.release_clipboard()  # leave real bytes, not a dead promise
+        paint_out.release_clipboard()  # leave real bytes, not a live object
         print("Doom has left the canvas.")
 
 

@@ -121,10 +121,10 @@ def paint_is_foreground(hwnd: int) -> bool:
     return root == hwnd or _window_exe(root) == "mspaint.exe"
 
 
-# Frames go out through a delayed-rendering clipboard owner (see clipserve):
-# publishing waits until Paint has actually READ the previous frame
-# (WM_RENDERFORMAT) instead of guessing settle timers, so Paint never races
-# our rewrite into its "Can't complete operation" error dialog.
+# Frames go out through a live OLE data object (see clipserve): the clipboard
+# is written once at boot, and every paste calls back into us for the newest
+# frame. No per-frame rewrite means Paint's paste can never race one into its
+# "Can't complete operation" error dialog.
 _clip_server = None
 
 
@@ -136,7 +136,7 @@ def _clipboard() -> "clipserve.ClipboardServer":
 
 
 def release_clipboard() -> None:
-    """Swap the delayed-render promise for real bytes (call before exiting)."""
+    """Swap the live data object for real bytes (call before exiting)."""
     if _clip_server is not None:
         _clip_server.finalize()
 
