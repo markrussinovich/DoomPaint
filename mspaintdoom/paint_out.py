@@ -489,7 +489,8 @@ class _Paster:
         sv, (vl, vt, vr, vb) = found
         if vr - vl >= width and vb - vt >= height:
             return True
-        if not win32gui.IsZoomed(self._hwnd):  # maximized = as big as it gets
+        # maximized = as big as it gets (IsZoomed isn't wrapped by win32gui)
+        if not ctypes.windll.user32.IsZoomed(self._hwnd):
             wl, wt, wr, wb = win32gui.GetWindowRect(self._hwnd)
             # window chrome around the viewport, plus slack for the scrollbar
             # strip that disappears once the canvas fits
