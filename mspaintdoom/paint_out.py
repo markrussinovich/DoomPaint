@@ -8,13 +8,13 @@ Two paste paths, chosen at startup by a self-test:
 * MenuPaster — Paint's Edit>Paste via UI Automation. Rock-solid, but briefly
   opens the Edit menu each frame, which can swallow keystrokes. Fallback only.
 
-Both COMMIT the pasted floating selection by switching to the Brushes tool via
-UI Automation — never with a synthetic Esc, because Esc while the player holds
-Ctrl to fire becomes Ctrl+Esc and opens the Windows Start menu.
+Each new paste implicitly commits the previous floating selection, so no
+explicit per-frame commit is needed; the final frame is left floating on exit.
 """
 import ctypes
 import io
 import os
+import re
 import subprocess
 import threading
 import time
@@ -89,28 +89,54 @@ def launch_paint(timeout: float = 20.0) -> int:
     raise RuntimeError("Paint window did not appear")
 
 
-def focus_paint(hwnd: int) -> None:
+def focus_paint(hwnd: int, timeout: float = 5.0) -> bool:
+    """Bring Paint to the foreground and confirm it, returning success.
+
+    Retries until Paint is actually foreground or `timeout` elapses. A freshly
+    launched window usually activates on the first try, but one we're *attaching*
+    to (Paint was already open behind another window) often does not, and
+    Windows' foreground lock rejects SetForegroundWindow from a background
+    process until a synthetic Alt tap grants permission. Callers that then drive
+    Paint (canvas priming, the Ctrl+V self-test) depend on this actually landing;
+    a single best-effort attempt was what let the self-test flake to the slow
+    menu paster when Paint started unfocused.
+    """
     if win32gui.IsIconic(hwnd):
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-    try:
-        win32gui.SetForegroundWindow(hwnd)
-    except win32gui.error:
-        pass  # foreground lock — fall through to stronger measures
-    time.sleep(0.1)
-    if paint_is_foreground(hwnd):
-        return
-    # Foreground lock workaround #1: SwitchToThisWindow (alt-tab semantics).
-    ctypes.windll.user32.SwitchToThisWindow(hwnd, True)
-    time.sleep(0.2)
-    if paint_is_foreground(hwnd):
-        return
-    # Workaround #2: a synthetic Alt tap grants SetForegroundWindow permission.
-    sendinput.send_keys((win32con.VK_MENU, False), (win32con.VK_MENU, True))
-    try:
-        win32gui.SetForegroundWindow(hwnd)
-    except win32gui.error:
-        pass
-    time.sleep(0.2)
+    deadline = time.perf_counter() + timeout
+    alt_tapped = False
+    while True:
+        if paint_is_foreground(hwnd):
+            return True
+        try:
+            win32gui.SetForegroundWindow(hwnd)
+        except win32gui.error:
+            pass  # foreground lock — fall through to stronger measures
+        if paint_is_foreground(hwnd):
+            return True
+        # Workaround #1: SwitchToThisWindow (alt-tab semantics). Targets our
+        # window only, so it's safe to retry each iteration.
+        ctypes.windll.user32.SwitchToThisWindow(hwnd, True)
+        time.sleep(0.1)
+        if paint_is_foreground(hwnd):
+            return True
+        # Workaround #2: a synthetic Alt tap grants SetForegroundWindow
+        # permission past the foreground lock — but do it ONCE only. It's a
+        # global keystroke, so repeating it every iteration would spam the menu
+        # bar of whatever window actually has focus if Paint won't come forward.
+        if not alt_tapped:
+            alt_tapped = True
+            sendinput.send_keys(
+                (win32con.VK_MENU, False), (win32con.VK_MENU, True))
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+            except win32gui.error:
+                pass
+            if paint_is_foreground(hwnd):
+                return True
+        if time.perf_counter() >= deadline:
+            return False
+        time.sleep(0.2)
 
 
 def paint_is_foreground(hwnd: int) -> bool:
@@ -121,11 +147,13 @@ def paint_is_foreground(hwnd: int) -> bool:
     return root == hwnd or _window_exe(root) == "mspaint.exe"
 
 
-# Frames go out through a live OLE data object (see clipserve): the clipboard
-# is written once at boot, and every paste calls back into us for the newest
-# frame. No per-frame rewrite means Paint's paste can never race one into its
-# "Can't complete operation" error dialog.
+# Frames go out through an OLE IDataObject clipboard owner (see clipserve):
+# publishing waits until the previous frame has actually been read (a GetData
+# call on our data object) instead of guessing settle timers, and updates the
+# frame bytes in place so we never race a rewrite into Paint's "Can't complete
+# operation" error dialog.
 _clip_server = None
+_error_watchdog_wake = threading.Event()
 
 
 def _clipboard() -> "clipserve.ClipboardServer":
@@ -136,89 +164,293 @@ def _clipboard() -> "clipserve.ClipboardServer":
 
 
 def release_clipboard() -> None:
-    """Swap the live data object for real bytes (call before exiting)."""
+    """Stop the clipboard server, flushing real bytes onto the clipboard so the
+    last frame stays pasteable after we exit (call before exiting)."""
     if _clip_server is not None:
         _clip_server.finalize()
 
 
-def frame_to_clipboard(img: Image.Image) -> None:
+def frame_to_dib(img: Image.Image) -> bytes:
     with io.BytesIO() as out:
         img.save(out, "BMP")
-        dib = out.getvalue()[14:]  # strip BITMAPFILEHEADER -> CF_DIB payload
-    _clipboard().publish(dib)
+        return out.getvalue()[14:]  # strip BITMAPFILEHEADER -> CF_DIB payload
+
+
+def encode_frame(frame, scale: int = 1) -> bytes:
+    """numpy RGB frame -> CF_DIB bytes (optionally integer-upscaled)."""
+    img = Image.fromarray(frame)
+    if scale > 1:
+        img = img.resize((img.width * scale, img.height * scale),
+                         Image.Resampling.NEAREST)
+    return frame_to_dib(img)
+
+
+def frame_to_clipboard(img: Image.Image) -> bool:
+    return _clipboard().publish(frame_to_dib(img))
 
 
 def ctrl_v_paste(hwnd: int) -> None:
     """Synthetic Ctrl+V — only if Paint is foreground. Opens no menu."""
     if not paint_is_foreground(hwnd):
         raise PaintNotFocusedError
+    # A held Shift (the run key) reaches Paint, and Paint reads modifiers
+    # globally, so our injected V arrives as Ctrl+Shift+V — not the paste
+    # accelerator — and the paste silently no-ops, freezing frames while you
+    # run. Release any held Shift for the (atomic) chord, then re-press it so
+    # running continues. The whole sequence is one SendInput batch, so the
+    # window where Shift reads "up" to the game is negligible.
+    shifts = keys.held_shift_vks()
+    seq = [(vk, True) for vk in shifts]  # release held Shift(s)
     # If the player is already holding Ctrl (to fire), don't inject our own
     # Ctrl press/release around V — sending Ctrl-up would drop their held key.
-    if keys.ctrl_physically_down():
-        sendinput.send_keys((ord("V"), False), (ord("V"), True))
+    ctrl_down = keys.ctrl_physically_down()
+    if ctrl_down:
+        seq += [(ord("V"), False), (ord("V"), True)]
     else:
-        sendinput.send_keys((keys.VK_CONTROL, False), (ord("V"), False),
-                            (ord("V"), True), (keys.VK_CONTROL, True))
+        seq += [(keys.VK_CONTROL, False), (ord("V"), False),
+                (ord("V"), True), (keys.VK_CONTROL, True)]
+    seq += [(vk, False) for vk in shifts]  # re-press Shift(s) to keep running
+    sendinput.send_keys(*seq)
+    if not ctrl_down:
         # Our Ctrl tap latches GetAsyncKeyState's 0x0001 bit; clear it so the
         # next input poll doesn't read it as the player firing.
         keys.consume_tap(keys.VK_CONTROL)
 
 
-class _BrushesCommitter:
-    """Shared UIA setup: the Brushes tool button used to commit a floating paste.
+_VK_PAGE_UP = 0x21
+_VK_PAGE_DOWN = 0x22
 
-    Selecting a tool flattens the pasted floating selection onto the canvas
-    without drawing anything (drawing needs a mouse stroke) and without opening
-    a menu or sending a keystroke — so it can't drag the frame with arrow keys,
-    can't leave a selection mini-toolbar, and can't form a bad key-chord.
 
-    The button vanishes from the UIA tree if the user hides Paint's toolbar,
-    so commit is best-effort: a missing button means frames paste uncommitted
-    (each paste flattens the previous one anyway), never a crash. We re-probe
-    periodically so re-showing the toolbar restores commits mid-game.
-    """
+def _zoom_percent(win) -> int:
+    text = win.child_window(
+        auto_id="ZoomValuesComboBox",
+        control_type="ComboBox").wrapper_object().selected_text()
+    values = re.findall(r"\d+", text)
+    if not values:
+        raise ValueError(f"unrecognized Paint zoom value: {text!r}")
+    return int(values[0])
 
-    _REPROBE_EVERY = 25  # frames between probes while the button is missing
+
+def _ctrl_key(key: int) -> None:
+    """Send a Ctrl+<key> chord. Respects a player-held Ctrl (don't wrap our own
+    Ctrl press/release around the key — that would drop their held fire), and
+    clears the async tap latch our synthetic Ctrl leaves behind so the input
+    poll doesn't read it as a shot."""
+    if keys.ctrl_physically_down():
+        sendinput.send_keys((key, False), (key, True))
+    else:
+        sendinput.send_keys((keys.VK_CONTROL, False), (key, False),
+                            (key, True), (keys.VK_CONTROL, True))
+        keys.consume_tap(keys.VK_CONTROL)
+
+
+def _zoom_step(hwnd: int, win, key: int) -> bool:
+    if not paint_is_foreground(hwnd):
+        return False
+    before = _zoom_percent(win)
+    _ctrl_key(key)
+    for _ in range(40):
+        time.sleep(0.05)
+        if _zoom_percent(win) != before:
+            return True
+    return False
+
+
+def _reset_zoom(hwnd: int, win) -> bool:
+    if not paint_is_foreground(hwnd):
+        return False
+    if _zoom_percent(win) == 100:
+        return True
+    _ctrl_key(ord("0"))
+    deadline = time.perf_counter() + 2.0
+    while time.perf_counter() < deadline:
+        time.sleep(0.05)
+        if _zoom_percent(win) == 100:
+            return True
+    return False
+
+
+def _canvas_geometry(win, view_hwnd: int):
+    image = win.child_window(
+        auto_id="image", control_type="Group").wrapper_object().rectangle()
+    view = win32gui.GetWindowRect(view_hwnd)
+    return image, view
+
+
+def _canvas_pixel_size(win) -> tuple[int, int]:
+    text = win.child_window(
+        auto_id="CanvasSizeTextBlock",
+        control_type="Text").wrapper_object().window_text()
+    size = re.findall(r"\d+", text)
+    if len(size) < 2:
+        raise ValueError(f"unrecognized Paint canvas size: {text!r}")
+    return int(size[0]), int(size[1])
+
+
+def _full_image_visible(win, image) -> bool:
+    width, height = _canvas_pixel_size(win)
+    zoom = _zoom_percent(win) / 100
+    expected_w = round(width * zoom)
+    expected_h = round(height * zoom)
+    return image.width() >= expected_w - 2 \
+        and image.height() >= expected_h - 2
+
+
+def _resize_handle_point(win, view_hwnd: int):
+    image, (view_l, view_t, view_r, view_b) = _canvas_geometry(
+        win, view_hwnd)
+    if not _full_image_visible(win, image):
+        return None
+    point = image.right + 4, image.bottom + 4
+    if view_l <= point[0] < view_r and view_t <= point[1] < view_b:
+        return point
+    return None
+
+
+def _margin_click_point(win, view_hwnd: int):
+    image, (view_l, view_t, view_r, view_b) = _canvas_geometry(
+        win, view_hwnd)
+    if not _full_image_visible(win, image):
+        return None
+    gap = 30
+    mid_x = (image.left + image.right) // 2
+    candidates = (
+        (image.right + gap, image.top + gap),
+        (image.left - gap, image.top + gap),
+        (mid_x, image.bottom + gap),
+        (mid_x, image.top - gap),
+    )
+    for x, y in candidates:
+        if view_l + 10 <= x < view_r - 10 \
+                and view_t + 10 <= y < view_b - 10:
+            return x, y
+    return None
+
+
+def _click_screen_point(point) -> None:
+    original = win32api.GetCursorPos()
+    try:
+        win32api.SetCursorPos(point)
+        win32api.mouse_event(
+            win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        win32api.mouse_event(
+            win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+    finally:
+        win32api.SetCursorPos(original)
+
+
+def fit_canvas_zoom(hwnd: int) -> int | None:
+    """Fit the canvas quickly, then snap down to an exact pixel ratio."""
+    from pywinauto import Application
+    from pywinauto.timings import Timings
+    Timings.window_find_timeout = 1.0
+    try:
+        win = Application(backend="uia").connect(handle=hwnd) \
+            .window(handle=hwnd)
+        before = _zoom_percent(win)
+        win.child_window(
+            title="Fit to window", control_type="Button").invoke()
+        deadline = time.perf_counter() + 2.0
+        while _zoom_percent(win) == before \
+                and time.perf_counter() < deadline:
+            time.sleep(0.02)
+        time.sleep(0.2)
+        view = win32gui.FindWindowEx(hwnd, 0, "MSPaintView", None)
+        width, height = _canvas_pixel_size(win)
+
+        def whole_pixels(pct):  # the scaled image lands on whole pixels
+            return width * pct % 100 == 0 and height * pct % 100 == 0
+
+        current = _zoom_percent(win)
+        while not whole_pixels(current) \
+                or _margin_click_point(win, view) is None:
+            if not _zoom_step(hwnd, win, _VK_PAGE_DOWN):
+                return None
+            current = _zoom_percent(win)
+        return current
+    except Exception:
+        return None
+
+
+def prime_canvas(hwnd: int, target_width: int,
+                 target_height: int) -> tuple[int, int, int] | None:
+    """Drag to the smallest canvas possible below the target frame size."""
+    from pywinauto import Application
+    from pywinauto.timings import Timings
+    Timings.window_find_timeout = 1.0
+    try:
+        win = Application(backend="uia").connect(handle=hwnd) \
+            .window(handle=hwnd)
+        original_zoom = _zoom_percent(win)
+        width, height = _canvas_pixel_size(win)
+        if (width, height) == (1, 1):
+            return original_zoom, width, height
+        if not paint_is_foreground(hwnd) \
+                or win32api.GetAsyncKeyState(win32con.VK_LBUTTON) & 0x8000:
+            return None
+        view = win32gui.FindWindowEx(hwnd, 0, "MSPaintView", None)
+        margin = _margin_click_point(win, view)
+        if margin is None and _zoom_percent(win) > 100:
+            if not _reset_zoom(hwnd, win):
+                return None
+            margin = _margin_click_point(win, view)
+        while margin is None:
+            if not _zoom_step(hwnd, win, _VK_PAGE_DOWN):
+                return None
+            margin = _margin_click_point(win, view)
+        _click_screen_point(margin)
+        time.sleep(0.1)
+        start = _resize_handle_point(win, view)
+        if start is None:
+            return None
+        image, _ = _canvas_geometry(win, view)
+    except Exception:
+        return None
+
+    end = image.left + 1, image.top + 1
+    original = win32api.GetCursorPos()
+    pressed = False
+    try:
+        win32api.SetCursorPos(start)
+        win32api.mouse_event(
+            win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        pressed = True
+        for step in range(1, 13):
+            x = start[0] + (end[0] - start[0]) * step // 12
+            y = start[1] + (end[1] - start[1]) * step // 12
+            win32api.SetCursorPos((x, y))
+            time.sleep(0.005)
+    finally:
+        if pressed:
+            win32api.mouse_event(
+                win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        win32api.SetCursorPos(original)
+
+    for _ in range(10):
+        width, height = _canvas_pixel_size(win)
+        if width < target_width and height < target_height:
+            return original_zoom, width, height
+        time.sleep(0.05)
+    return None
+
+
+class _Paster:
+    """Paste frames into Paint. Each new paste implicitly commits the previous
+    floating selection, so no explicit per-frame commit is needed."""
 
     def __init__(self, hwnd: int):
         from pywinauto import Application
         from pywinauto.timings import Timings
-        # Default element-find timeout is 5 s; at game speed a failed lookup
-        # must cost a dropped frame, not a multi-second stall.
         Timings.window_find_timeout = 1.0
         self._hwnd = hwnd
         self._win = Application(backend="uia").connect(handle=hwnd) \
             .window(handle=hwnd)
-        self._misses = 0
-        if self._probe() is None:
-            print("  (Brushes button not found — toolbar hidden? Frames will "
-                  "paste uncommitted; re-show the toolbar to restore per-frame "
-                  "undo steps)")
+        self._crop = self._win.child_window(
+            auto_id="CropButton", control_type="Button").wrapper_object()
+        self._fit_after_paste = False
 
-    def _probe(self):
-        try:
-            self._brushes = self._win.child_window(
-                auto_id="BrushesSplitButton",
-                control_type="RadioButton").wrapper_object()
-        except Exception:
-            self._brushes = None
-        return self._brushes
-
-    def _commit(self) -> None:
-        if self._brushes is None:
-            self._misses += 1
-            if self._misses % self._REPROBE_EVERY or self._probe() is None:
-                return
-        try:
-            self._brushes.invoke()
-        except Exception:
-            # Stale element (toolbar toggled, UI rebuilt): re-resolve, retry.
-            if self._probe() is None:
-                return
-            try:
-                self._brushes.invoke()
-            except Exception:
-                self._brushes = None
+    def fit_zoom_after_next_paste(self) -> None:
+        self._fit_after_paste = True
 
     def set_zoom(self, percent: int) -> bool:
         """Set Paint's view zoom via the status-bar slider (best-effort).
@@ -287,62 +519,34 @@ class _BrushesCommitter:
             pass
         return False
 
-    def size_canvas(self, width: int, height: int) -> bool:
-        """Make the canvas exactly width x height (the Doom display size).
+    def paste(self) -> None:
+        if not self.paste_uncommitted():
+            return
+        if self._fit_after_paste:
+            if not self._wait_for_selection():
+                raise RuntimeError("Paint did not create a pasted selection")
+            fit_canvas_zoom(self._hwnd)
+            self._fit_after_paste = False
 
-        Pasting a display-sized frame auto-grows a smaller canvas, and the
-        floating selection then covers exactly the target rect at the origin —
-        so cropping the canvas to that selection also trims the white margins
-        of a larger pre-existing canvas. Best-effort: if it fails, the first
-        game frame still grows the canvas to fit; it just may keep margins.
-        """
-        frame_to_clipboard(Image.new("RGB", (width, height)))
-        try:
-            if not self.paste_uncommitted():
-                return False
-        except PaintNotFocusedError:
-            return False
-        time.sleep(0.2)  # let the floating selection register before cropping
-        if not self._crop_to_selection():
-            return False
-        self._commit()
-        return True
-
-    def _crop_to_selection(self) -> bool:
-        for locator in ({"auto_id": "CropButton", "control_type": "Button"},
-                        {"title": "Crop", "control_type": "Button"}):
-            try:
-                self._win.child_window(**locator).wrapper_object().invoke()
+    def _wait_for_selection(self, timeout: float = 0.6) -> bool:
+        """Wait until a floating selection appears (Paint's Crop button enables)."""
+        deadline = time.perf_counter() + timeout
+        while time.perf_counter() < deadline:
+            if self._crop.is_enabled():
                 return True
-            except Exception:
-                continue
-        # Toolbar hidden? Ctrl+Shift+X crops too, and boot (before the game
-        # loop starts polling) is a safe moment for a synthetic chord.
-        try:
-            sendinput.send_keys(
-                (keys.VK_CONTROL, False), (keys.VK_SHIFT, False),
-                (ord("X"), False), (ord("X"), True),
-                (keys.VK_SHIFT, True), (keys.VK_CONTROL, True))
-        except OSError:
-            return False
-        keys.consume_tap(keys.VK_CONTROL)
-        keys.consume_tap(keys.VK_SHIFT)
-        return True
+            time.sleep(0.002)
+        return False
 
 
-class KeyPaster(_BrushesCommitter):
-    """Preferred: paste with Ctrl+V (no menu), commit by switching tools."""
+class KeyPaster(_Paster):
+    """Preferred: paste with Ctrl+V (no menu); the next paste commits it."""
 
     def paste_uncommitted(self) -> bool:
         ctrl_v_paste(self._hwnd)
         return True
 
-    def paste(self) -> None:
-        self.paste_uncommitted()
-        self._commit()
 
-
-class MenuPaster(_BrushesCommitter):
+class MenuPaster(_Paster):
     """Fallback: paste via the Edit>Paste menu item (briefly opens the menu)."""
 
     def __init__(self, hwnd: int):
@@ -367,10 +571,6 @@ class MenuPaster(_BrushesCommitter):
                 time.sleep(0.05)
         return False
 
-    def paste(self) -> None:
-        if self.paste_uncommitted():
-            self._commit()
-
 
 def _window_changed(before: "Image.Image | None",
                     after: "Image.Image | None") -> bool:
@@ -382,17 +582,60 @@ def _window_changed(before: "Image.Image | None",
     return float(np.mean(np.any(a != b, axis=2))) > 0.05
 
 
-def key_paste_lands(hwnd: int, attempts: int = 4) -> bool:
-    """Self-test: does a synthetic Ctrl+V actually paint the canvas here?
+def key_paste_lands(hwnd: int, width: int = 640, height: int = 400,
+                    attempts: int = 4) -> bool:
+    """Self-test: does a synthetic Ctrl+V actually reach this Paint?
 
-    Pastes alternating solid colours and checks the window changed. Runs a few
-    times because the first paste after launch is often a warm-up no-op.
+    A landed paste becomes a floating selection, which enables Paint's Crop
+    button — a UI Automation signal that's robust to the window compositing and
+    PrintWindow capture quirks a screenshot diff isn't. Retries a few times
+    because the first paste after launch is often a warm-up no-op. Falls back to
+    a pixel-diff check if the selection state can't be queried.
     """
-    if not paint_is_foreground(hwnd):
+    if not focus_paint(hwnd):
         return False
-    swatches = [Image.new("RGB", (640, 400), c)
+    try:
+        from pywinauto import Application
+        from pywinauto.timings import Timings
+        Timings.window_find_timeout = 1.0
+        win = Application(backend="uia").connect(handle=hwnd) \
+            .window(handle=hwnd)
+        crop = win.child_window(auto_id="CropButton",
+                                control_type="Button").wrapper_object()
+        if crop.is_enabled():
+            # A selection is already active, so "selection appeared" can't tell
+            # us anything; use the pixel-diff self-test instead.
+            return _pixel_paste_lands(hwnd, width, height, attempts)
+    except Exception:
+        return _pixel_paste_lands(hwnd, width, height, attempts)
+    swatch = Image.new("RGB", (width, height), (10, 220, 80))
+    for _ in range(attempts):
+        if not focus_paint(hwnd):
+            return False
+        frame_to_clipboard(swatch)
+        try:
+            ctrl_v_paste(hwnd)
+        except PaintNotFocusedError:
+            return False
+        deadline = time.perf_counter() + 0.6
+        while time.perf_counter() < deadline:
+            try:
+                if crop.is_enabled():  # a floating selection => paste landed
+                    return True
+            except Exception:
+                break
+            time.sleep(0.02)
+    return False
+
+
+def _pixel_paste_lands(hwnd: int, width: int, height: int,
+                       attempts: int) -> bool:
+    """Fallback self-test: diff the window pixels around a paste."""
+    swatches = [Image.new("RGB", (width, height), c)
                 for c in ((10, 220, 80), (220, 40, 140))]
     for i in range(attempts):
+        if not focus_paint(hwnd):
+            return False
         before = capture.grab_window(hwnd)
         frame_to_clipboard(swatches[i % 2])
         try:
@@ -405,15 +648,18 @@ def key_paste_lands(hwnd: int, attempts: int = 4) -> bool:
     return False
 
 
-def window_stale(before: "Image.Image | None",
-                 after: "Image.Image | None") -> bool:
-    """Window content is essentially unchanged (pastes aren't landing)."""
-    if before is None or after is None:
-        return False  # can't tell; don't accuse the paster
-    a, b = np.asarray(before), np.asarray(after)
-    if a.shape != b.shape:
-        return False
-    return float(np.mean(np.any(a != b, axis=2))) < 0.005
+def _dismiss_dialog(dlg) -> None:
+    """Dismiss the clipboard-error dialog with a UIA click on its Close button.
+
+    Deliberately NOT via an Escape keystroke: the player may be holding Ctrl to
+    fire, and a synthetic Escape then becomes Ctrl+Esc — which pops the Windows
+    Start menu. A UIA invoke sends no keys, so it's safe whatever's held down.
+    """
+    try:
+        dlg.child_window(auto_id="CloseButton",
+                         control_type="Button").invoke()
+    except Exception:
+        pass
 
 
 def dismiss_error_dialog(hwnd: int) -> bool:
@@ -430,51 +676,55 @@ def dismiss_error_dialog(hwnd: int) -> bool:
                                control_type="Window")
         if not dlg.exists(timeout=0.2):
             return False
-        dlg.child_window(auto_id="CloseButton",
-                         control_type="Button").invoke()
+        _dismiss_dialog(dlg)
         return True
     except Exception:
         return False
 
 
 def start_error_watchdog(hwnd: int) -> None:
-    """Background thread: dismiss the "Can't complete operation" dialog
-    within ~0.4 s of it appearing. The in-loop staleness check still exists
-    as backup, but this one doesn't wait for frames to visibly freeze."""
+    """Start a watchdog that polls UIA only after a paste miss."""
     def run():
         import comtypes
         try:
             comtypes.CoInitialize()
         except OSError:
             pass
-        try:
-            from pywinauto import Application
-            win = Application(backend="uia").connect(handle=hwnd) \
-                .window(handle=hwnd)
-        except Exception:
-            return
-        dlg = win.child_window(title_re=".*complete operation.*",
-                               control_type="Window")
-        # Hot loop on purpose: a check costs ~20 ms, so at this cadence the
-        # dialog is gone within ~150 ms of appearing — a blink, not a popup.
         while True:
+            _error_watchdog_wake.wait()
+            _error_watchdog_wake.clear()
             try:
-                if dlg.exists(timeout=0.01):
-                    dlg.child_window(auto_id="CloseButton",
-                                     control_type="Button").invoke()
-                    print("  (clipboard-error dialog dismissed)")
+                from pywinauto import Application
+                win = Application(backend="uia").connect(handle=hwnd) \
+                    .window(handle=hwnd)
             except Exception:
-                pass
-            time.sleep(0.1)
+                continue
+            dlg = win.child_window(title_re=".*complete operation.*",
+                                   control_type="Window")
+            deadline = time.perf_counter() + 2.0
+            while time.perf_counter() < deadline:
+                try:
+                    if dlg.exists(timeout=0.01):
+                        _dismiss_dialog(dlg)
+                        print("  (clipboard-error dialog dismissed)")
+                        break
+                except Exception:
+                    break
+                if _error_watchdog_wake.wait(0.03):
+                    _error_watchdog_wake.clear()
+                    deadline = time.perf_counter() + 2.0
 
     threading.Thread(target=run, daemon=True,
                      name="mspaintdoom-dlg-watchdog").start()
 
 
-def push_frame(hwnd: int, frame, paster, scale: int = 1) -> None:
-    img = Image.fromarray(frame)
-    if scale > 1:
-        img = img.resize((img.width * scale, img.height * scale),
-                         Image.Resampling.NEAREST)
-    frame_to_clipboard(img)
+def arm_error_watchdog() -> None:
+    _error_watchdog_wake.set()
+
+
+def push_frame(paster, render_fn) -> bool:
+    """Advertise the freshest frame — produced only when Paint reads the
+    clipboard (render_fn is a zero-arg thunk) — and paste it."""
+    previous_consumed = _clipboard().publish(render_fn=render_fn)
     paster.paste()
+    return previous_consumed
