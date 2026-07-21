@@ -5,6 +5,7 @@ __pycache__/
 
 # per-session / machine-generated
 last_run.log
+game_stdout.log
 _vizdoom.ini
 smoke_frame.png
 cap_before.png
