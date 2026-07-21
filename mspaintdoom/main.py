@@ -74,12 +74,13 @@ class OnDemandRenderer:
         with self._lock:
             self._reset_sound = True
 
-    def stop(self, timeout: float = 2.0) -> None:
+    def stop(self, timeout: float = 5.0) -> bool:
         """Signal the engine thread and wait for it to leave engine.step(), so
-        the caller can close ViZDoom (which is not thread-safe) without racing an
-        in-flight step."""
+        the caller can close ViZDoom (which is not thread-safe) without racing
+        an in-flight step. Returns whether the thread actually stopped."""
         self._stop.set()
         self._thread.join(timeout)
+        return not self._thread.is_alive()
 
     def _step_encode(self) -> bytes:
         now = time.perf_counter()
@@ -455,11 +456,16 @@ def run() -> int:
     except KeyboardInterrupt:
         return 0
     finally:
-        renderer.stop()
+        engine_idle = renderer.stop()
         music.stop()
         # Finalize while the engine is still alive so the last frame persists.
         paint_out.release_clipboard()
-        engine.close()
+        if engine_idle:
+            engine.close()
+        else:
+            # A step still in flight: closing ViZDoom under it can crash the
+            # interpreter. Let process exit reap the engine instead.
+            log("renderer thread didn't stop; skipping engine.close()")
         print("Doom has left the canvas.")
 
 

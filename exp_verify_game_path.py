@@ -81,13 +81,22 @@ def main():
     dialog2 = paint_out.dismiss_error_dialog(hwnd)
     print(f"error dialog: {dialog2}")
 
-    # Phase 3: finalize -> real bytes must remain readable.
+    # Phase 3: finalize -> real bytes must remain readable. OpenClipboard
+    # fails while any window (e.g. Paint's last read) still has the
+    # clipboard open, so give it a few tries.
     paint_out.release_clipboard()
-    win32clipboard.OpenClipboard()
-    try:
-        data = win32clipboard.GetClipboardData(win32clipboard.CF_DIB)
-    finally:
-        win32clipboard.CloseClipboard()
+    data = b""
+    for _ in range(20):
+        try:
+            win32clipboard.OpenClipboard()
+        except win32clipboard.error:
+            time.sleep(0.1)
+            continue
+        try:
+            data = win32clipboard.GetClipboardData(win32clipboard.CF_DIB)
+        finally:
+            win32clipboard.CloseClipboard()
+        break
     print(f"post-exit clipboard CF_DIB: {len(data)} bytes")
 
     ok = landed and recovered and not dialog1 and not dialog2 \

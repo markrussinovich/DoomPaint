@@ -19,15 +19,26 @@ leaves the last frame pasteable.
 
 The data object lives on a dedicated STA thread pumping messages, so the
 cross-process GetData calls are serviced promptly.
+
+If another app takes the clipboard (user copies something while alt-tabbed),
+a WM_CLIPBOARDUPDATE listener flags the loss and the next publish() —
+i.e. only once the game is actively pushing frames again — re-publishes our
+object. Reclaiming on publish rather than on a timer means a copy the user
+makes while the game is paused stays theirs.
 """
 import atexit
+import ctypes
+import struct
 import threading
+import time
+from ctypes import wintypes
 
 import pythoncom
-import win32api
-import win32event
 from win32com.server.exception import COMException
 from win32com.server.util import wrap
+
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 CF_DIB = 8
 _DVASPECT_CONTENT = 1
@@ -36,7 +47,46 @@ _DATADIR_GET = 1
 _DV_E_FORMATETC = -2147221404
 _E_NOTIMPL = -2147467263
 _OLE_E_ADVISENOTSUPPORTED = -2147221501
-_WM_QUIT = 0x0012
+_WM_CLIPBOARDUPDATE = 0x031D
+_WM_APP_REPUBLISH = 0x8001
+_WM_APP_FLUSH = 0x8002
+_HWND_MESSAGE = wintypes.HWND(-3)
+
+_WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT,
+                              wintypes.WPARAM, wintypes.LPARAM)
+
+
+class _WNDCLASSW(ctypes.Structure):
+    _fields_ = (("style", wintypes.UINT), ("lpfnWndProc", _WNDPROC),
+                ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HICON),
+                ("hCursor", ctypes.c_void_p), ("hbrBackground", ctypes.c_void_p),
+                ("lpszMenuName", wintypes.LPCWSTR),
+                ("lpszClassName", wintypes.LPCWSTR))
+
+
+for fn, res, args in (
+        (_user32.DefWindowProcW, ctypes.c_ssize_t,
+         (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)),
+        (_user32.CreateWindowExW, wintypes.HWND,
+         (wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+          ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+          wintypes.HWND, ctypes.c_void_p, wintypes.HINSTANCE,
+          ctypes.c_void_p)),
+        (_user32.AddClipboardFormatListener, wintypes.BOOL, (wintypes.HWND,)),
+        (_user32.PostMessageW, wintypes.BOOL,
+         (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)),
+        (_user32.SendMessageW, ctypes.c_ssize_t,
+         (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)),
+        (_kernel32.GetModuleHandleW, wintypes.HMODULE, (wintypes.LPCWSTR,))):
+    fn.restype, fn.argtypes = res, args
+
+
+def _blank_dib(width: int = 640, height: int = 400) -> bytes:
+    """A black CF_DIB, served if anything pastes before the first frame."""
+    header = struct.pack("<IiiHHIIiiII", 40, width, height, 1, 24, 0,
+                         width * height * 3, 0, 0, 0, 0)
+    return header + b"\x00" * (width * height * 3)
 
 
 class _EnumFORMATETC:
@@ -130,18 +180,22 @@ class ClipboardServer:
 
     def __init__(self):
         self._dib = b""
-        self._last_good = b""  # last non-empty frame actually served
+        self._last_good = _blank_dib()  # last non-empty frame actually served
         self._render_fn = None  # if set, called on demand to produce the DIB
         self._consumed = threading.Event()
         self._consumed.set()  # nothing pending yet
         self._lock = threading.Lock()
         self._ready = threading.Event()
-        self._tid = None
+        self._lost = False
+        self._hwnd = None
+        self._dataobj = None
         self._finalized = False
+        self._proc = _WNDPROC(self._wndproc)  # keep alive: GC'd proc = crash
         self._thread = threading.Thread(target=self._pump, daemon=True,
                                         name="mspaintdoom-clip")
         self._thread.start()
-        if not self._ready.wait(5.0):
+        if not self._ready.wait(5.0) or not self._hwnd \
+                or self._dataobj is None:
             raise RuntimeError("OLE clipboard server failed to start")
         atexit.register(self.finalize)
 
@@ -168,32 +222,64 @@ class ClipboardServer:
         return data
 
     def _pump(self):
-        self._tid = win32api.GetCurrentThreadId()
         pythoncom.OleInitialize()
-        self._dataobj = wrap(_DibDataObject(self._provide),
-                             pythoncom.IID_IDataObject)
-        pythoncom.OleSetClipboard(self._dataobj)
+        cls = _WNDCLASSW()
+        cls.lpfnWndProc = self._proc
+        cls.hInstance = _kernel32.GetModuleHandleW(None)
+        cls.lpszClassName = "MsPaintDoomClipSrv"
+        _user32.RegisterClassW(ctypes.byref(cls))
+        self._hwnd = _user32.CreateWindowExW(
+            0, cls.lpszClassName, None, 0, 0, 0, 0, 0, _HWND_MESSAGE,
+            None, cls.hInstance, None)
+        if self._hwnd:
+            do = wrap(_DibDataObject(self._provide),
+                      pythoncom.IID_IDataObject)
+            if self._set_clipboard(do):
+                self._dataobj = do
+            _user32.AddClipboardFormatListener(self._hwnd)
         self._ready.set()
-        # Message loop that also re-asserts clipboard ownership ~1x/sec. If the
-        # user (or any app) copies something while alt-tabbed, we lose the
-        # clipboard; without reacquiring we'd keep publishing to an object no
-        # longer on it, and Ctrl+V would paste their content, not the game frame.
-        # MsgWaitForMultipleObjects wakes immediately on Paint's GetData, so the
-        # ownership check adds no paste latency.
-        while True:
-            win32event.MsgWaitForMultipleObjects(
-                [], False, 1000, win32event.QS_ALLINPUT)
-            if pythoncom.PumpWaitingMessages():  # nonzero once WM_QUIT arrives
-                break
+        if self._dataobj is None:
+            return
+        msg = wintypes.MSG()
+        while _user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            _user32.TranslateMessage(ctypes.byref(msg))
+            _user32.DispatchMessageW(ctypes.byref(msg))
+
+    def _set_clipboard(self, do, attempts: int = 10) -> bool:
+        for _ in range(attempts):
             try:
-                if not pythoncom.OleIsCurrentClipboard(self._dataobj):
-                    pythoncom.OleSetClipboard(self._dataobj)
-            except Exception:
-                pass
+                pythoncom.OleSetClipboard(do)
+                return True
+            except pythoncom.com_error:
+                pythoncom.PumpWaitingMessages()
+                time.sleep(0.05)  # clipboard busy; retry shortly
+        return False
+
+    def _wndproc(self, hwnd, msg, wparam, lparam):
         try:
-            pythoncom.OleFlushClipboard()  # leave the last frame pasteable
+            if msg == _WM_CLIPBOARDUPDATE:
+                # Fires for our own OleSetClipboard too; the check sorts it out.
+                try:
+                    self._lost = not pythoncom.OleIsCurrentClipboard(
+                        self._dataobj)
+                except pythoncom.com_error:
+                    self._lost = True
+                return 0
+            if msg == _WM_APP_REPUBLISH:
+                if self._lost and self._set_clipboard(self._dataobj,
+                                                      attempts=1):
+                    self._lost = False
+                return 0
+            if msg == _WM_APP_FLUSH:
+                try:
+                    if pythoncom.OleIsCurrentClipboard(self._dataobj):
+                        pythoncom.OleFlushClipboard()
+                except pythoncom.com_error:
+                    pass
+                return 0
         except Exception:
-            pass
+            return 0  # never let an exception cross the ctypes boundary
+        return _user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
     # -- game-loop side -----------------------------------------------------
 
@@ -215,20 +301,18 @@ class ClipboardServer:
             if dib is not None:
                 self._dib = dib
             self._consumed.clear()  # arm "not yet consumed" atomically with data
+        if self._lost:  # someone else took the clipboard: reclaim it
+            _user32.PostMessageW(self._hwnd, _WM_APP_REPUBLISH, 0, 0)
         return previous_consumed
 
     def finalize(self) -> None:
-        """Stop the STA pump and wait for it to flush the last frame onto the
-        clipboard as a static copy. The join matters: the pump is a daemon
-        thread, so without waiting the process can exit and kill it before
-        OleFlushClipboard runs — leaving Paint's final read pointed at our dead
-        data object, which pops the "Can't complete operation" dialog on quit."""
+        """Snapshot the live object into real clipboard bytes. The flush is a
+        synchronous SendMessage to the STA thread, so it has completed before
+        this returns — the process can't exit with Paint's final read pointed
+        at our dead data object (which pops the "Can't complete operation"
+        dialog on quit)."""
         if self._finalized:
             return
         self._finalized = True
-        if self._tid:
-            try:
-                win32api.PostThreadMessage(self._tid, _WM_QUIT, 0, 0)
-            except Exception:
-                pass
-        self._thread.join(2.0)
+        if self._hwnd and self._dataobj is not None:
+            _user32.SendMessageW(self._hwnd, _WM_APP_FLUSH, 0, 0)
