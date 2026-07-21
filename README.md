@@ -13,7 +13,9 @@ pasted into Paint's canvas as a genuine document edit. Which means:
 - The spreadsheet-tier framerate is part of the charm.
 - **Ctrl+Z rewinds time.** Every frame is an undo step. You died? Un-die.
 - File > Save at any moment produces a legitimate `.png` of your current frame,
-  because as far as Paint knows, you painted it.
+  because as far as Paint knows, you painted it -- and it's also a real save:
+  File > Open that same picture later and the game resumes from that exact
+  spot (position, health, inventory, level state), not just the screenshot.
 
 ## Run
 
@@ -49,7 +51,10 @@ window, the default), `--skill 1..5`, `--no-sound` (all audio off),
 `--music-wad PATH` (soundtrack from another WAD),
 `--res 320x200|320x240|640x400|640x480` (default `640x400`;
 `320x200` is Doom's native res and pastes fastest, `320x240` is the
-aspect-correct 4:3 view — see **How it works**).
+aspect-correct 4:3 view — see **How it works**), `--wait-for-open` (don't take
+over Paint immediately -- wait hands-off, no input capture or pasting, until
+you open a previously saved screenshot yourself via File > Open, then resume
+from it and take over).
 
 **Game data & soundtrack**: `wad\doom1.wad` — the freely-distributable
 shareware episode — is both the game data and the source of the real Bobby
@@ -162,6 +167,17 @@ echoes registered inputs to the console live.
    frame the instant it reads — so what appears reflects the current game state
    rather than the one queued when the Ctrl+V was sent, measurably lowering
    on-screen latency.
+
+   The menu paster opens Paint's own Edit menu every frame, which can collide
+   with the player opening a menu themselves (e.g. navigating to File > Save
+   As) — modern Paint's menu flyouts don't change window focus, so the game
+   can't just check "is a dialog focused" to notice. It instead checks
+   whether *any* Paint menu/flyout popup is currently open and skips pasting
+   that frame rather than fight the player for the menu bar; there's no
+   direct Paste button in this Paint's ribbon to invoke instead (checked —
+   only Select/Object Select live in the Selection group), so avoiding the
+   collision is the best available fix short of the menu paster itself never
+   being needed.
 3. **Sound** — effects come from the engine itself (ViZDoom plays them through
    OpenAL on the default device; the sfx volume is pinned at launch because
    ZDoom persists cvars to `_vizdoom.ini`, and a stale zero would mute every
@@ -200,12 +216,28 @@ echoes registered inputs to the console live.
    first and wins. Ctrl+Z time-rewind still works: a Z pressed while Ctrl is
    captured is re-injected into Paint as a clean Ctrl+Z chord. Shift is the
    only game key left pass-through. Alt-tabbing still pauses the game: keys
-   are only captured while Paint is foreground. If the hook can't install,
-   input falls back to plain `GetAsyncKeyState` polling (old behavior, keys
-   leak into Paint). Input is sampled once per engine tic on the render
-   thread, so control latency tracks the 35 Hz tic rate rather than the
-   slower paste rate; a tap latch still catches keys pressed and released
-   between samples.
+   are only captured while Paint is foreground (a *strict* foreground check —
+   an owned Save As/Open dialog belongs to the same process but must not
+   count, or the hook would keep swallowing game-bound letters like E/Q while
+   you type a filename). If the hook can't install, input falls back to
+   plain `GetAsyncKeyState` polling (old behavior, keys leak into Paint).
+   Input is sampled once per engine tic on the render thread, so control
+   latency tracks the 35 Hz tic rate rather than the slower paste rate; a
+   tap latch still catches keys pressed and released between samples.
+5. **Save & resume** — File > Save embeds a real ZDoom savegame (position,
+   velocity, health, inventory, level/monster/door/item state — everything
+   `save`/`load` restore, not just the rendered frame) inside the screenshot
+   PNG's own metadata (`savepng.py`, a `zTXt` chunk every viewer, including
+   Paint, silently ignores). File > Open later extracts it and resumes play
+   from that instant. `saveload.py`'s `SaveLoadWatcher` detects Paint's own
+   Save As/Open dialog (matched by title, case-insensitively — Windows 11
+   Paint titles it `Save as`, lowercase) and resolves which file it touched
+   via the shell's Recent Items shortcuts (the same mechanism for classic and
+   packaged Paint). Best-effort throughout: if a step ever fails, Paint's own
+   File > Save/Open keep working normally, the resume just doesn't trigger.
+   `--wait-for-open` skips the usual immediate takeover entirely and just
+   waits for a File > Open of a save instead, so you can open Paint yourself
+   first.
 
 **Frames commit implicitly — no synthetic Esc, no click.** An earlier version
 committed each floating selection explicitly (first with Esc, later with an
@@ -221,6 +253,8 @@ opening any menu that could eat gameplay keys.
   wrapper), `paint_out.py` (Paint window mgmt, pasting, watchdogs),
   `clipserve.py` (OLE `IDataObject` clipboard owner), `keys.py` (keyboard
   hook + polling), `music.py` (WAD music → MIDI, audio plumbing),
+  `saveload.py` (detects Paint's Save As/Open dialog + which file it
+  touched), `savepng.py` (embeds/extracts a savegame inside a PNG),
   `sendinput.py`, `capture.py`
 - `wad\doom1.wad` — shareware DOOM (game data + episode 1 soundtrack)
 - `third_party\OpenAL32.dll` — OpenAL-Soft 1.24 (installed over ViZDoom's by
@@ -228,6 +262,7 @@ opening any menu that could eat gameplay keys.
 - `run_debug.bat` — run with live input echo (`MSPAINTDOOM_DEBUG=1`)
 - `last_run.log` — written every session: inputs, pauses, audio self-heal
 - `smoke_test.py` — engine renders headlessly, no Paint involved
+- `save_load_spike.py` — engine save/load round trip, headless
 - `test_quiet.py` — clipboard→paste→capture round-trip without touching focus
 - `exp_ole_clip.py`, `exp_verify_game_path.py` — the experiments that proved
   out the OLE clipboard design (kept as documentation)

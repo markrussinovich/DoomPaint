@@ -1,5 +1,7 @@
 """Doom engine wrapper (ViZDoom + bundled Freedoom WADs)."""
 import os
+import shutil
+import tempfile
 import threading
 import time
 
@@ -88,19 +90,32 @@ class DoomEngine:
         hider = threading.Thread(target=_suppress_engine_window,
                                  args=(hide_done,), daemon=True)
         hider.start()
+        # ZDoom resolves its savegame (and _vizdoom.ini config) directory
+        # from the process's current working directory at init() time — no
+        # command-line flag (-savedir / +save_dir) overrides it, and it's
+        # cached rather than re-read per save, so a temporary chdir bracketing
+        # just the init() call isolates saves into their own directory
+        # without disturbing the caller's cwd for anything else (all game/WAD
+        # paths above are already absolute, so this doesn't affect loading).
+        self._save_dir = tempfile.mkdtemp(prefix="doompaint_save_")
+        orig_cwd = os.getcwd()
         try:
+            os.chdir(self._save_dir)
             try:
-                g.init()
-            except vzd.ViZDoomErrorException:
-                if not sound:
-                    raise
-                # Audio backend can be missing (e.g. no output device); retry.
-                print("  (audio init failed — running without sound effects)")
-                g.set_sound_enabled(False)
-                g.init()
-            time.sleep(0.2)  # window may show a beat after init returns
+                try:
+                    g.init()
+                except vzd.ViZDoomErrorException:
+                    if not sound:
+                        raise
+                    # Audio backend can be missing (e.g. no output device); retry.
+                    print("  (audio init failed — running without sound effects)")
+                    g.set_sound_enabled(False)
+                    g.init()
+                time.sleep(0.2)  # window may show a beat after init returns
+            finally:
+                hide_done.set()
         finally:
-            hide_done.set()
+            os.chdir(orig_cwd)
         self._last_frame = self._grab()
 
     def _grab(self) -> np.ndarray:
@@ -116,6 +131,46 @@ class DoomEngine:
         self._game.make_action(list(action), max(1, tics))
         return self._grab()
 
+    def save_state(self, slot: int = 1) -> bytes:
+        """Snapshot full engine state via ZDoom's native savegame.
+
+        Unlike the pasted frame, this is a real save: position, health,
+        ammo/inventory, level, and monster/door/item state, all restorable
+        with load_state(). Returns the raw .zds bytes (a small zip archive)
+        so the caller can stash them anywhere (e.g. embedded in a PNG).
+        """
+        path = os.path.join(self._save_dir, f"{slot}.zds")
+        if os.path.exists(path):
+            os.remove(path)
+        self._game.send_game_command(f"save {slot} doompaint")
+        noop = [0] * len(BUTTONS)
+        deadline = time.monotonic() + 2.0
+        while not os.path.exists(path) and time.monotonic() < deadline:
+            self._game.make_action(noop, 1)
+        if not os.path.exists(path):
+            raise RuntimeError("ZDoom did not produce a save file")
+        with open(path, "rb") as f:
+            data = f.read()
+        os.remove(path)
+        return data
+
+    def load_state(self, data: bytes, slot: int = 1) -> np.ndarray:
+        """Restore engine state from bytes previously returned by save_state().
+
+        Position and velocity are both restored, so gameplay resumes exactly
+        as it was mid-motion (a few tics of momentum settling afterward is
+        correct behavior, not a bug).
+        """
+        path = os.path.join(self._save_dir, f"{slot}.zds")
+        with open(path, "wb") as f:
+            f.write(data)
+        self._game.send_game_command(f"load {slot}")
+        noop = [0] * len(BUTTONS)
+        for _ in range(3):  # let the load actually take effect
+            self._game.make_action(noop, 1)
+        os.remove(path)
+        return self._grab()
+
     def reset_sound(self) -> None:
         """Re-initialize the engine's sound system (ZDoom's snd_reset).
 
@@ -129,3 +184,4 @@ class DoomEngine:
 
     def close(self) -> None:
         self._game.close()
+        shutil.rmtree(self._save_dir, ignore_errors=True)

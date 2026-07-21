@@ -31,5 +31,5 @@ game.close()
 first, last = frames[0], frames[-1]
 print("frame shape:", first.shape, first.dtype)
 print("frames differ:", not np.array_equal(first, last))
-Image.fromarray(last).save(r"C:\Source\MsPaintDoom\smoke_frame.png")
+Image.fromarray(last).save(os.path.join(os.path.dirname(__file__), "smoke_frame.png"))
 print("saved smoke_frame.png")

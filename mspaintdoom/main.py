@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 
-from . import keys, paint_out
+from . import keys, paint_out, savepng, saveload
 from . import music as music_mod
 from .engine_vzd import TICRATE, DoomEngine
 from .music import MusicPlayer
@@ -76,6 +76,11 @@ class OnDemandRenderer:
         self._reset_sound = False
         self._latest_dib = b""
         self._lock = threading.Lock()
+        # ViZDoom is not thread-safe: anything that touches self._engine
+        # directly (the per-tic step below, and save_state/load_state) must
+        # hold this lock so the save/load feature can never race the render
+        # thread's own engine.step() calls.
+        self._engine_lock = threading.Lock()
         self._stop = threading.Event()
         self._new_frame = threading.Event()  # set when a fresh tic frame exists
         try:
@@ -117,19 +122,38 @@ class OnDemandRenderer:
         self._last = now
         with self._lock:
             reset, self._reset_sound = self._reset_sound, False
-        if reset:
-            self._engine.reset_sound()
-        # Step one tic at a time, sampling input before each, so a catch-up burst
-        # doesn't apply a single input sample (or a stale tap) to all N tics.
-        frame = None
-        for _ in range(tics):
-            action = self._poll()  # per tic, on the engine's clock
-            with self._lock:
-                if action[4] and not self._latest_action[4]:
-                    self._fires += 1
-                self._latest_action = action
-            frame = self._engine.step(action, 1)
+        with self._engine_lock:
+            if reset:
+                self._engine.reset_sound()
+            # Step one tic at a time, sampling input before each, so a catch-up
+            # burst doesn't apply a single input sample (or a stale tap) to all
+            # N tics.
+            frame = None
+            for _ in range(tics):
+                action = self._poll()  # per tic, on the engine's clock
+                with self._lock:
+                    if action[4] and not self._latest_action[4]:
+                        self._fires += 1
+                    self._latest_action = action
+                frame = self._engine.step(action, 1)
         return paint_out.encode_frame(frame, self._scale)  # immutable bytes
+
+    def save_state(self) -> bytes:
+        """Thread-safe wrapper around DoomEngine.save_state (see there): waits
+        out any in-flight tic on the render thread rather than racing it."""
+        with self._engine_lock:
+            return self._engine.save_state()
+
+    def load_state(self, data: bytes) -> None:
+        """Thread-safe wrapper around DoomEngine.load_state: restores engine
+        state and immediately publishes the resulting frame, so the next
+        paste reflects the resumed position rather than waiting a tic."""
+        with self._engine_lock:
+            frame = self._engine.load_state(data)
+        dib = paint_out.encode_frame(frame, self._scale)
+        with self._lock:
+            self._latest_dib = dib
+        self._new_frame.set()
 
     def latest_frame(self) -> bytes:
         with self._lock:
@@ -204,6 +228,11 @@ def run() -> int:
                          "commercial doom.wad you own for the original "
                          "tracks (wad\\doom.wad / wad\\doom2.wad are "
                          "auto-detected). Game data stays Freedoom.")
+    ap.add_argument("--wait-for-open", action="store_true",
+                    help="don't take over Paint immediately: wait, hands "
+                         "off (no input capture, no pasting), until you "
+                         "open a previously saved Doom screenshot yourself "
+                         "(File > Open), then resume from it and take over")
     args = ap.parse_args()
 
     # Session log: what the game actually saw, for post-mortem diagnosis.
@@ -288,22 +317,69 @@ def run() -> int:
                 say("  (music: no track found for this map)")
         threading.Thread(target=music_boot, daemon=True,
                          name="music-boot").start()
-    print("Finding MS Paint...")
-    print("Paste pacing: engine-tic paced (scales to your hardware)")
-    hwnd = paint_out.launch_paint()
-    if not paint_out.focus_paint(hwnd):
-        print("  (couldn't bring Paint to the foreground — if it's open behind "
-              "another window, click it so keystrokes and pastes land)")
-        log("could not focus Paint at startup")
+    if args.wait_for_open:
+        print("Waiting for you to open MS Paint yourself "
+              "(hands off until then; F12 to quit)...")
+        hwnd = None
+        while hwnd is None:
+            if keys.quit_requested():
+                print("F12 — quitting.")
+                return 0
+            hwnd = paint_out.find_paint()
+            if hwnd is None:
+                time.sleep(0.3)
+        print("Found MS Paint. File > Open your saved Doom screenshot to "
+              "resume — the game takes over the moment it sees one.")
+        saveload_watcher = saveload.SaveLoadWatcher(hwnd)
+        frame0 = None
+        while frame0 is None:
+            if keys.quit_requested():
+                print("F12 — quitting.")
+                saveload_watcher.close()
+                return 0
+            load_path = saveload_watcher.take_pending_load()
+            if load_path:
+                save_data = savepng.extract_save(load_path)
+                if save_data is None:
+                    log(f"{load_path} opened — no embedded save state")
+                    print(f"  ({os.path.basename(load_path)} has no saved "
+                          "game state — still waiting)")
+                else:
+                    frame0 = engine.load_state(save_data)
+                    log(f"loaded save state from {load_path}")
+                    print(f"  (resumed game state from "
+                          f"{os.path.basename(load_path)} — taking over)")
+            else:
+                time.sleep(0.2)
+        print("Paste pacing: engine-tic paced (scales to your hardware)")
+        if not paint_out.focus_paint(hwnd):
+            print("  (couldn't bring Paint to the foreground — if it's open "
+                  "behind another window, click it so keystrokes and pastes "
+                  "land)")
+            log("could not focus Paint after resume")
+        if not args.no_sound:
+            engine.reset_sound()
+            log("proactive snd_reset after resume")
+    else:
+        print("Finding MS Paint...")
+        print("Paste pacing: engine-tic paced (scales to your hardware)")
+        hwnd = paint_out.launch_paint()
+        if not paint_out.focus_paint(hwnd):
+            print("  (couldn't bring Paint to the foreground — if it's open "
+                  "behind another window, click it so keystrokes and pastes "
+                  "land)")
+            log("could not focus Paint at startup")
 
-    frame0 = engine.step([0] * 9, 1)  # warm up one tic
-    if not args.no_sound:
-        # The engine's OpenAL init can come up silent (device race at boot);
-        # rebuild it unconditionally now that a tic has run and device
-        # enumeration has settled. Harmless if the init was fine, and doesn't
-        # count against the reactive self-heal's reset budget below.
-        engine.reset_sound()
-        log("proactive snd_reset after warm-up tic")
+        frame0 = engine.step([0] * 9, 1)  # warm up one tic
+        if not args.no_sound:
+            # The engine's OpenAL init can come up silent (device race at
+            # boot); rebuild it unconditionally now that a tic has run and
+            # device enumeration has settled. Harmless if the init was fine,
+            # and doesn't count against the reactive self-heal's reset budget
+            # below.
+            engine.reset_sound()
+            log("proactive snd_reset after warm-up tic")
+        saveload_watcher = saveload.SaveLoadWatcher(hwnd)
     if paint_out.dismiss_error_dialog(hwnd):
         print("Dismissed a leftover Paint error dialog.")
     paint_out.start_error_watchdog(hwnd, print_fn=say)
@@ -369,7 +445,11 @@ def run() -> int:
 
     # Capture game keys before Paint sees them: a stray arrow key in Paint
     # dismisses the paste menu / drags the pasted selection and stalls frames.
-    if keys.install_hook(lambda: paint_out.paint_is_foreground(hwnd)):
+    # Gate on canvas_has_focus (not the more lenient paint_is_foreground): a
+    # Save As/Open dialog belongs to the same mspaint.exe process, so the
+    # lenient check would otherwise keep swallowing game-bound letters while
+    # the player is just typing a filename.
+    if keys.install_hook(lambda: paint_out.canvas_has_focus(hwnd)):
         print("Input capture: on (game keys won't reach Paint while playing)")
     else:
         print("Input capture: unavailable — keys may leak into Paint")
@@ -400,7 +480,11 @@ def run() -> int:
             if keys.quit_requested():
                 say("F12 — quitting.")
                 return 0
-            if not (paint_out.paint_is_foreground(hwnd)
+            # Strict check (not the lenient paint_is_foreground): pasting
+            # sends real synthetic keystrokes, which must never fire while a
+            # Save As/Open dialog (same process) or any other window
+            # actually has keyboard focus.
+            if not (paint_out.canvas_has_focus(hwnd)
                     or os.environ.get("MSPAINTDOOM_NOFOCUS")):
                 if not was_paused:
                     log("paused (Paint lost focus)")
@@ -414,6 +498,46 @@ def run() -> int:
                 was_paused = False
             music.resume()
             renderer.set_paused(False)
+
+            # Only relevant for the MenuPaster fallback, which opens Paint's
+            # own Edit menu every frame to paste: if the player has a menu
+            # (e.g. File) open right now to reach Save As/Open, that
+            # automation would collide with theirs and can knock their menu
+            # around. Skip pasting this frame instead of fighting them for
+            # the menu bar -- canvas_has_focus can't see this (these are
+            # non-activating popups that don't change the foreground window).
+            if paint_out.has_open_popup(hwnd):
+                time.sleep(0.05)
+                continue
+
+            save_path = saveload_watcher.take_pending_save()
+            if save_path:
+                try:
+                    data = renderer.save_state()
+                    savepng.embed_save(save_path, data)
+                    saveload_watcher.note_written(save_path)
+                    log(f"embedded save state into {save_path}")
+                    say(f"  (game state saved into "
+                        f"{os.path.basename(save_path)})")
+                except Exception as e:
+                    log(f"save embed failed for {save_path}: {e}")
+
+            load_path = saveload_watcher.take_pending_load()
+            if load_path:
+                try:
+                    save_data = savepng.extract_save(load_path)
+                    if save_data is None:
+                        log(f"{load_path} opened — no embedded save state")
+                    else:
+                        # Publishes the restored frame itself (sets the
+                        # renderer's new-frame flag), so the loop's normal
+                        # push_frame call below picks it up naturally.
+                        renderer.load_state(save_data)
+                        log(f"loaded save state from {load_path}")
+                        say(f"  (resumed game state from "
+                            f"{os.path.basename(load_path)})")
+                except Exception as e:
+                    log(f"load restore failed for {load_path}: {e}")
 
             # Input is now sampled per engine tic on the renderer thread; read
             # the latest sample here for logging and the fire-edge self-heal.
@@ -497,6 +621,7 @@ def run() -> int:
     finally:
         engine_idle = renderer.stop()
         music.stop()
+        saveload_watcher.close()
         # Finalize while the engine is still alive so the last frame persists.
         paint_out.release_clipboard()
         if engine_idle:

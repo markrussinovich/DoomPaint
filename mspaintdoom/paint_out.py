@@ -147,6 +147,49 @@ def paint_is_foreground(hwnd: int) -> bool:
     return root == hwnd or _window_exe(root) == "mspaint.exe"
 
 
+def canvas_has_focus(hwnd: int) -> bool:
+    """True only when hwnd itself -- the main Paint window -- is exactly the
+    foreground window. Unlike paint_is_foreground (which also counts any
+    other top-level mspaint.exe window, so gameplay doesn't pause for the
+    app's own menu flyouts), this is False while an owned dialog such as
+    Save As/Open/Print has focus. Used to gate the input hook: those dialogs
+    belong to the same process, so the lenient check would otherwise keep
+    swallowing game-bound letters (e.g. E/Q for strafe) while the player is
+    just trying to type a filename.
+    """
+    return win32gui.GetForegroundWindow() == hwnd
+
+
+def has_open_popup(hwnd: int) -> bool:
+    """True if Paint currently has a menu/flyout popup open (File menu, Edit
+    menu, a dropdown, ...).
+
+    Modern (WinUI) Paint's menu flyouts are non-activating popups -- opening
+    one doesn't change GetForegroundWindow away from the main window, so
+    canvas_has_focus can't see them. That matters because the MenuPaster
+    fallback opens Paint's own Edit menu every frame to paste: if the player
+    has the File menu open at that exact moment (e.g. navigating to Save As),
+    the two menu automations collide and the player's own menu can get
+    knocked around or dismissed. Checked before each paste attempt so the
+    game yields instead of fighting the player over the menu bar.
+    """
+    found: list[int] = []
+
+    def cb(popup_hwnd, _):
+        if popup_hwnd == hwnd or not win32gui.IsWindowVisible(popup_hwnd):
+            return True
+        cls = win32gui.GetClassName(popup_hwnd)
+        if "Popup" not in cls and "Flyout" not in cls:
+            return True
+        owner = win32gui.GetWindow(popup_hwnd, win32con.GW_OWNER)
+        if owner == hwnd:
+            found.append(popup_hwnd)
+        return True
+
+    win32gui.EnumWindows(cb, None)
+    return bool(found)
+
+
 # Frames go out through an OLE IDataObject clipboard owner (see clipserve):
 # publishing waits until the previous frame has actually been read (a GetData
 # call on our data object) instead of guessing settle timers, and updates the
@@ -190,8 +233,15 @@ def frame_to_clipboard(img: Image.Image) -> bool:
 
 
 def ctrl_v_paste(hwnd: int) -> None:
-    """Synthetic Ctrl+V — only if Paint is foreground. Opens no menu."""
-    if not paint_is_foreground(hwnd):
+    """Synthetic Ctrl+V — only if Paint's canvas is exactly foreground.
+
+    Deliberately strict (canvas_has_focus, not paint_is_foreground): this
+    sends real OS-level synthetic keystrokes, which land wherever keyboard
+    focus actually is. If a Save As/Open dialog (same process, so the lenient
+    check would still say "foreground") or any other window has focus
+    instead, this must not fire a Ctrl+V into it.
+    """
+    if not canvas_has_focus(hwnd):
         raise PaintNotFocusedError
     # A held Shift (the run key) reaches Paint, and Paint reads modifiers
     # globally, so our injected V arrives as Ctrl+Shift+V — not the paste
