@@ -62,9 +62,13 @@ soundtrack, or pass `--music-wad PATH`.
 If you hear nothing: the boot log prints `Audio out: <device> at <N>%` —
 check that's the device you're actually listening on, and that its volume
 isn't near zero. The game repairs its own per-app mixer volumes at startup
-(Windows persists those forever, and a session once muted stays muted), and
-if you're firing into a dead-silent engine it resets the engine's sound
-system automatically (see **Sound** below).
+(Windows persists those forever, and a session once muted stays muted),
+rebuilds the engine's sound system once at boot (its audio init can come up
+silently broken), and if you're still firing into a dead-silent engine it
+resets the sound system again automatically (see **Sound** below).
+
+While playing, the console shows a live `pastes/s` ticker (one line, updated
+in place) — the actual rate frames are landing in Paint.
 
 Debugging: every session writes `last_run.log` (registered inputs,
 pause/resume, engine audio peaks, self-heal events). `run_debug.bat` also
@@ -125,6 +129,12 @@ echoes registered inputs to the console live.
    the UIA menu fallback. On exit `OleFlushClipboard` leaves the last frame
    pasteable.
 
+   If another app takes the clipboard — you alt-tab away and copy something —
+   a clipboard listener flags the loss, and the game reclaims ownership with
+   the next frame it publishes. Reclaiming on publish rather than on a timer
+   means a copy you make while the game is paused stays yours until you
+   return to Paint.
+
    Paint's per-frame cost is dominated by pixel count, not per-paste overhead,
    so frame **resolution** is the biggest lever on smoothness. The default
    640×400 is the heaviest; `--res 320x200` (Doom's authentic native
@@ -162,10 +172,13 @@ echoes registered inputs to the console live.
    1.24's WASAPI backend tracks the default device automatically.
 
    The engine's audio init can also come up silently broken (device opens,
-   renders zeros, engine never notices — nondeterministic). The game
-   **self-heals**: it meters its own engine's audio session while you play,
-   and firing into silence triggers ZDoom's `snd_reset` (an in-place sound
-   system rebuild) within a few seconds, logged in `last_run.log`.
+   renders zeros, engine never notices — nondeterministic). Two defenses:
+   at boot, once the first tic has run and device enumeration has settled,
+   the game unconditionally triggers ZDoom's `snd_reset` (an in-place sound
+   system rebuild — harmless if the init was fine). And it **self-heals**
+   during play: it meters its own engine's audio session, and firing into
+   silence triggers another `snd_reset` within a few seconds, logged in
+   `last_run.log`.
 
    Music is a different story: ViZDoom strips ZDoom's music playback
    entirely, so `music.py` pulls the map's music lump straight out of the
@@ -189,8 +202,10 @@ echoes registered inputs to the console live.
    only game key left pass-through. Alt-tabbing still pauses the game: keys
    are only captured while Paint is foreground. If the hook can't install,
    input falls back to plain `GetAsyncKeyState` polling (old behavior, keys
-   leak into Paint). A tap latch catches keys pressed and released between
-   the ~200 ms input samples.
+   leak into Paint). Input is sampled once per engine tic on the render
+   thread, so control latency tracks the 35 Hz tic rate rather than the
+   slower paste rate; a tap latch still catches keys pressed and released
+   between samples.
 
 **Frames commit implicitly — no synthetic Esc, no click.** An earlier version
 committed each floating selection explicitly (first with Esc, later with an
@@ -214,6 +229,8 @@ opening any menu that could eat gameplay keys.
 - `last_run.log` — written every session: inputs, pauses, audio self-heal
 - `smoke_test.py` — engine renders headlessly, no Paint involved
 - `test_quiet.py` — clipboard→paste→capture round-trip without touching focus
+- `exp_ole_clip.py`, `exp_verify_game_path.py` — the experiments that proved
+  out the OLE clipboard design (kept as documentation)
 - `cap_now.py <out.png>` — snapshot the Paint window (works while occluded)
 - `PLAN.md` — original build plan
 
