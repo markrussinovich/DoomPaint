@@ -23,6 +23,35 @@ MAX_TICS_PER_FRAME = 7  # cap catch-up so slow pastes slow the game, not warp it
 PASTE_MISSES_BEFORE_FALLBACK = 8
 
 
+class _StatusLine:
+    """The pastes/s ticker: one console line rewritten in place instead of a
+    new line per report. Messages that can arrive while the ticker is live
+    must go through print() here so they land on their own line rather than
+    appended to the ticker. Falls back to one-line-per-report when stdout
+    isn't a terminal (redirected to a file), where \\r is just noise.
+    """
+
+    def __init__(self):
+        self._live = sys.stdout.isatty()
+        self._active = False
+        self._lock = threading.Lock()
+
+    def update(self, msg: str) -> None:
+        with self._lock:
+            if self._live:
+                print(f"\r{msg:<40}", end="", flush=True)  # pad over leftovers
+                self._active = True
+            else:
+                print(msg)
+
+    def print(self, *args, **kwargs) -> None:
+        with self._lock:
+            if self._active:
+                print()
+                self._active = False
+            print(*args, **kwargs)
+
+
 class OnDemandRenderer:
     """Free-run the engine on a dedicated thread at the tic rate; the clipboard
     read returns the most recent pre-encoded frame.
@@ -189,6 +218,9 @@ def run() -> int:
     log(f"boot args={vars(args)}")
     log("pacing: engine-tic + Paint-readiness (no rate cap)")
 
+    ticker = _StatusLine()
+    say = ticker.print  # for anything that may print while the ticker is live
+
     # Game data: prefer the real (shareware) DOOM WAD when it covers the
     # requested map — shareware is episode 1 only; Freedoom fills the rest.
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -222,8 +254,8 @@ def run() -> int:
         # tracks the default). Note it anyway, with the recovery path.
         def on_device_change():
             device_changed_at[0] = time.perf_counter()
-            print("  (default audio device changed — audio should follow; "
-                  "if sound effects vanish, F12 and relaunch run.bat)")
+            say("  (default audio device changed — audio should follow; "
+                "if sound effects vanish, F12 and relaunch run.bat)")
         music_mod.watch_default_device(on_device_change)
 
     music = MusicPlayer(volume=args.music_volume / 100)
@@ -247,13 +279,13 @@ def run() -> int:
             if music.start(music_wad, args.map):
                 which = ("original soundtrack"
                          if music_wad != engine.wad_path else "map track")
-                print(f"  (music: looping the {which} via Windows MIDI)")
+                say(f"  (music: looping the {which} via Windows MIDI)")
             elif music_wad != engine.wad_path \
                     and music.start(engine.wad_path, args.map):
-                print("  (music: track missing in the music WAD; using the "
-                      "Freedoom one)")
+                say("  (music: track missing in the music WAD; using the "
+                    "Freedoom one)")
             else:
-                print("  (music: no track found for this map)")
+                say("  (music: no track found for this map)")
         threading.Thread(target=music_boot, daemon=True,
                          name="music-boot").start()
     print("Finding MS Paint...")
@@ -265,9 +297,16 @@ def run() -> int:
         log("could not focus Paint at startup")
 
     frame0 = engine.step([0] * 9, 1)  # warm up one tic
+    if not args.no_sound:
+        # The engine's OpenAL init can come up silent (device race at boot);
+        # rebuild it unconditionally now that a tic has run and device
+        # enumeration has settled. Harmless if the init was fine, and doesn't
+        # count against the reactive self-heal's reset budget below.
+        engine.reset_sound()
+        log("proactive snd_reset after warm-up tic")
     if paint_out.dismiss_error_dialog(hwnd):
         print("Dismissed a leftover Paint error dialog.")
-    paint_out.start_error_watchdog(hwnd)
+    paint_out.start_error_watchdog(hwnd, print_fn=say)
 
     # Frames paste at native size; on-screen scaling uses Paint's free,
     # nearest-neighbor view zoom (a 640x400 canvas at 200% is pixel-identical
@@ -359,7 +398,7 @@ def run() -> int:
     try:
         while True:
             if keys.quit_requested():
-                print("F12 — quitting.")
+                say("F12 — quitting.")
                 return 0
             if not (paint_out.paint_is_foreground(hwnd)
                     or os.environ.get("MSPAINTDOOM_NOFOCUS")):
@@ -386,7 +425,7 @@ def run() -> int:
                      "strafeL", "strafeR"), action) if a]
                 log(f"input: {'+'.join(pressed) or '(none)'}")
                 if os.environ.get("MSPAINTDOOM_DEBUG"):
-                    print(f"  input: {'+'.join(pressed) or '(none)'}")
+                    say(f"  input: {'+'.join(pressed) or '(none)'}")
                 last_action = action
             # Pace on the two things that actually gate a new frame — no timer:
             #   (a) the engine advanced a tic (a fresh frame exists), and
@@ -406,7 +445,7 @@ def run() -> int:
                 # drop the frame and keep playing, never crash the game.
                 dropped += 1
                 if dropped % 25 == 1:
-                    print(f"  (frame dropped: {type(e).__name__}: {e})")
+                    say(f"  (frame dropped: {type(e).__name__}: {e})")
                 continue
 
             frames += 1
@@ -425,8 +464,8 @@ def run() -> int:
                         sound_resets += 1
                         log(f"engine silent despite firing — snd_reset "
                             f"#{sound_resets}")
-                        print("  (engine audio is silent — resetting the "
-                              "engine sound system)")
+                        say("  (engine audio is silent — resetting the "
+                            "engine sound system)")
                         renderer.request_reset_sound()
                     fires_in_window = 0
             if isinstance(paster, paint_out.KeyPaster):
@@ -439,19 +478,19 @@ def run() -> int:
                         f"{PASTE_MISSES_BEFORE_FALLBACK}")
                     if paste_misses >= PASTE_MISSES_BEFORE_FALLBACK:
                         if paint_out.dismiss_error_dialog(hwnd):
-                            print("  (dismissed Paint's clipboard-error "
-                                  "dialog; retrying Ctrl+V)")
+                            say("  (dismissed Paint's clipboard-error "
+                                "dialog; retrying Ctrl+V)")
                             paste_misses = 0
                         else:
-                            print("Ctrl+V missed "
-                                  f"{PASTE_MISSES_BEFORE_FALLBACK} "
-                                  "consecutive pastes — switching to the "
-                                  "UIA menu paster.")
+                            say("Ctrl+V missed "
+                                f"{PASTE_MISSES_BEFORE_FALLBACK} "
+                                "consecutive pastes — switching to the "
+                                "UIA menu paster.")
                             paster = paint_out.MenuPaster(hwnd)
                             paste_misses = 0
             if frames % 50 == 0:
                 dt = time.perf_counter() - stat_t0
-                print(f"  {frames / dt:4.1f} pastes/s submitted")
+                ticker.update(f"  {frames / dt:4.1f} pastes/s submitted")
                 frames, stat_t0 = 0, time.perf_counter()
     except KeyboardInterrupt:
         return 0
@@ -466,7 +505,7 @@ def run() -> int:
             # A step still in flight: closing ViZDoom under it can crash the
             # interpreter. Let process exit reap the engine instead.
             log("renderer thread didn't stop; skipping engine.close()")
-        print("Doom has left the canvas.")
+        say("Doom has left the canvas.")
 
 
 if __name__ == "__main__":

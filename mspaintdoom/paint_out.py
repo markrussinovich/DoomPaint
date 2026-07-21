@@ -683,8 +683,9 @@ def dismiss_error_dialog(hwnd: int) -> bool:
         return False
 
 
-def start_error_watchdog(hwnd: int) -> None:
-    """Start a watchdog that polls UIA only after a paste miss."""
+def start_error_watchdog(hwnd: int, print_fn=print) -> None:
+    """Start a watchdog that polls UIA only after a paste miss. print_fn lets
+    the caller route the dismissal notice around its in-place status line."""
     def run():
         import comtypes
         try:
@@ -707,7 +708,7 @@ def start_error_watchdog(hwnd: int) -> None:
                 try:
                     if dlg.exists(timeout=0.01):
                         _dismiss_dialog(dlg)
-                        print("  (clipboard-error dialog dismissed)")
+                        print_fn("  (clipboard-error dialog dismissed)")
                         break
                 except Exception:
                     break
